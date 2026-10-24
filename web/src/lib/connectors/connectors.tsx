@@ -543,6 +543,13 @@ export const connectorConfigs: Record<
       },
       {
         type: "checkbox",
+        label: "connectors.github.fields.include_discussions.label",
+        name: "include_discussions",
+        description: "connectors.github.fields.include_discussions.description",
+        optional: true,
+      },
+      {
+        type: "checkbox",
         label: "connectors.github.fields.include_files.label",
         name: "include_files",
         description: "connectors.github.fields.include_files.description",

@@ -180,7 +180,7 @@ def test_reindex_unparseable_ids_yield_failures(
     weird = [
         "not a url",
         f"{_REPO_URL}/pull/not-a-number",
-        f"{_REPO_URL}/discussions/1",
+        f"{_REPO_URL}/discussions/not-a-number",
         f"{_REPO_URL}/blob/main",
     ]
 

@@ -25,6 +25,9 @@ from onyx.connectors.exceptions import (
 )
 from onyx.connectors.github.models import (
     GitHubCursorItem,
+    GitHubDiscussion,
+    GitHubDiscussionComment,
+    GitHubDiscussionPage,
     GitHubDocKind,
     GitHubFileContent,
     GitHubGitTree,
@@ -38,6 +41,7 @@ from onyx.connectors.github.models import (
 from onyx.connectors.github.rate_limit_utils import sleep_after_rate_limit_exception
 from onyx.connectors.github.source_operations import (
     GitHubApiError,
+    GitHubDiscussionsUnavailableError,
     GitHubRateLimitError,
     GitHubSourceOperations,
 )
@@ -193,7 +197,9 @@ def is_safe_repo_path(path: str) -> bool:
 def parse_github_document_id(doc_id: str) -> ParsedGitHubDocId | None:
     """Parse a document id (an html URL) the connector writes. None when the
     id has none of the shapes ``/<owner>/<repo>/pull/<n>``,
-    ``/<owner>/<repo>/issues/<n>`` or ``/<owner>/<repo>/blob/<branch>/<path>``.
+    ``/<owner>/<repo>/issues/<n>``,
+    ``/<owner>/<repo>/discussions/<n>`` or
+    ``/<owner>/<repo>/blob/<branch>/<path>``.
     """
     if any(ord(char) < 0x20 or ord(char) == 0x7F for char in doc_id):
         return None
@@ -216,6 +222,7 @@ def parse_github_document_id(doc_id: str) -> ParsedGitHubDocId | None:
     if kind_segment not in (
         GitHubDocKind.PULL_REQUEST.value,
         GitHubDocKind.ISSUE.value,
+        GitHubDocKind.DISCUSSIONS.value,
     ):
         return None
     if len(segments) != 4 or not segments[3].isdigit():
@@ -565,6 +572,109 @@ def _convert_issue_to_document(
     )
 
 
+def _discussion_timestamp(value: datetime | None) -> str:
+    converted = _utc(value)
+    return converted.isoformat() if converted is not None else ""
+
+
+def _discussion_author(login: str | None) -> str:
+    return f"@{login}" if login else "unknown author"
+
+
+def _render_discussion_comment(
+    comment: GitHubDiscussionComment, *, depth: int = 0
+) -> list[str]:
+    """A comment and its replies as indented plain-text lines."""
+    indent = "  " * depth
+    timestamp = _discussion_timestamp(comment.updated_at or comment.created_at)
+    header = f"{indent}{_discussion_author(comment.author_login)}"
+    if timestamp:
+        header += f" - {timestamp}"
+    if comment.is_accepted_answer:
+        header += " [ACCEPTED ANSWER]"
+    lines = [header]
+    body = (comment.body or "").strip()
+    if body:
+        lines.extend(f"{indent}{line}" for line in body.splitlines())
+    for reply in comment.replies:
+        lines.extend(_render_discussion_comment(reply, depth=depth + 1))
+    return lines
+
+
+def _convert_discussion_to_document(
+    discussion: GitHubDiscussion,
+    repo_full_name: str,
+    repo_external_access: ExternalAccess | None,
+    lookup_user: UserLookup,
+) -> Document:
+    # Split full_name (e.g., "owner/repo") into owner and repo
+    parts = repo_full_name.split("/", 1)
+    owner_name = parts[0] if parts else ""
+    repo_name = parts[1] if len(parts) > 1 else repo_full_name
+
+    sections: list[TextSection] = [
+        TextSection(link=discussion.url, text=discussion.body or "")
+    ]
+    sections.extend(
+        TextSection(
+            link=comment.url or discussion.url,
+            text="\n".join(_render_discussion_comment(comment)),
+        )
+        for comment in discussion.comments
+    )
+
+    num_comments = sum(1 + len(comment.replies) for comment in discussion.comments)
+    accepted_comment = next(
+        (comment for comment in discussion.comments if comment.is_accepted_answer),
+        None,
+    )
+    doc_metadata = {
+        "repo": repo_full_name,
+        "hierarchy": {
+            "source_path": [owner_name, repo_name, "discussions"],
+            "owner": owner_name,
+            "repo": repo_name,
+            "object_type": "discussion",
+        },
+    }
+    return Document(
+        id=discussion.url,
+        sections=sections,
+        source=DocumentSource.GITHUB,
+        external_access=repo_external_access,
+        semantic_identifier=f"{discussion.number}: {discussion.title}",
+        doc_updated_at=_utc(discussion.updated_at),
+        doc_created_at=_utc(discussion.created_at),
+        # this metadata is used in perm sync
+        doc_metadata=doc_metadata,
+        metadata={
+            k: [str(vi) for vi in v] if isinstance(v, list) else str(v)
+            for k, v in {
+                "object_type": "Discussion",
+                "id": discussion.number,
+                "user": (
+                    _get_userinfo(discussion.author_login, lookup_user)
+                    if discussion.author_login
+                    else None
+                ),
+                "repo": repo_full_name,
+                "category": (discussion.category.name if discussion.category else None),
+                "num_comments": str(num_comments),
+                "accepted_answer": accepted_comment is not None,
+                "answer_author": (
+                    _get_userinfo(accepted_comment.author_login, lookup_user)
+                    if accepted_comment and accepted_comment.author_login
+                    else None
+                ),
+                "created_at": _utc(discussion.created_at),
+                "updated_at": _utc(discussion.updated_at),
+                "answered_at": _utc(discussion.answer_chosen_at),
+            }.items()
+            if v is not None
+        },
+    )
+
+
 def _decode_file_content(raw: bytes) -> str | None:
     """Decode raw file bytes to text, or None if the content looks binary."""
     buf = BytesIO(raw)
@@ -625,6 +735,7 @@ class GithubConnectorStage(Enum):
     START = "start"
     PRS = "prs"
     ISSUES = "issues"
+    DISCUSSIONS = "discussions"
     FILES = "files"
 
 
@@ -646,16 +757,20 @@ class GithubConnectorCheckpoint(ConnectorCheckpoint):
     num_retrieved: int
     cursor_url: str | None = None
 
+    # GraphQL cursor of the next DISCUSSIONS listing page.
+    discussion_cursor: str | None = None
+
     def reset(self) -> None:
         """
-        Resets curr_page, num_retrieved, cursor_url, file_paths, and
-        file_paths_branch to their initial values (0, 0, None, None, None)
+        Resets curr_page, num_retrieved, cursor_url, file_paths,
+        file_paths_branch, and discussion_cursor to their initial values
         """
         self.curr_page = 0
         self.num_retrieved = 0
         self.cursor_url = None
         self.file_paths = None
         self.file_paths_branch = None
+        self.discussion_cursor = None
 
 
 def make_cursor_url_callback(
@@ -685,6 +800,7 @@ class GithubConnector(
         include_prs: bool = True,
         include_issues: bool = False,
         include_files: bool = False,
+        include_discussions: bool = False,
         branch: str | None = None,
     ) -> None:
         self.repo_owner = repo_owner.strip()
@@ -699,6 +815,7 @@ class GithubConnector(
         self.include_prs = include_prs
         self.include_issues = include_issues
         self.include_files = include_files
+        self.include_discussions = include_discussions
         # Branch to index files from; None means each repo's default branch.
         self.branch = (branch or "").strip() or None
         self._source_operations: GitHubSourceOperations | None = None
@@ -1114,6 +1231,163 @@ class GithubConnector(
         # True if more file batches remain for this repo.
         return (page + 1) * FILE_BATCH_SIZE < len(file_paths)
 
+    def _list_discussions_page_rate_limited(
+        self,
+        repo_full_name: str,
+        after: str | None,
+        attempt_num: int = 0,
+    ) -> GitHubDiscussionPage:
+        if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
+            raise RuntimeError(
+                "Re-tried fetching discussions too many times. Something is "
+                "going wrong with fetching objects from Github"
+            )
+        try:
+            return self.source_operations.list_discussions_page(
+                repo_full_name=repo_full_name, after=after
+            )
+        except GitHubRateLimitError:
+            sleep_after_rate_limit_exception(self.source_operations)
+            return self._list_discussions_page_rate_limited(
+                repo_full_name, after, attempt_num + 1
+            )
+
+    def _get_discussion_rate_limited(
+        self,
+        repo_full_name: str,
+        number: int,
+        attempt_num: int = 0,
+    ) -> GitHubDiscussion:
+        if attempt_num > _MAX_NUM_RATE_LIMIT_RETRIES:
+            raise RuntimeError(
+                "Re-tried fetching a discussion too many times. Something is "
+                "going wrong with fetching objects from Github"
+            )
+        try:
+            return self.source_operations.get_discussion(
+                repo_full_name=repo_full_name, number=number
+            )
+        except GitHubRateLimitError:
+            sleep_after_rate_limit_exception(self.source_operations)
+            return self._get_discussion_rate_limited(
+                repo_full_name, number, attempt_num + 1
+            )
+
+    def _fetch_repo_discussions(
+        self,
+        repo: GitHubRepository,
+        checkpoint: GithubConnectorCheckpoint,
+        start: datetime | None,
+        end: datetime | None,
+        is_slim: bool,
+        repo_external_access: ExternalAccess | None,
+    ) -> Generator[Document | ConnectorFailure, None, bool]:
+        """Emit one listing page of discussions for ``repo``.
+
+        Returns True when more pages remain and False when the listing is
+        drained or the update-time window was passed. A repo with discussions
+        turned off drains the stage instead of failing the run. A failure to
+        read one discussion yields a ConnectorFailure and no document, so an
+        already indexed discussion document keeps its old content.
+        """
+        try:
+            page: GitHubDiscussionPage = self._list_discussions_page_rate_limited(
+                repo.full_name, checkpoint.discussion_cursor
+            )
+        except GitHubDiscussionsUnavailableError:
+            logger.warning(
+                "Discussions are unavailable for repo %s; skipping",
+                repo.full_name,
+            )
+            checkpoint.discussion_cursor = None
+            return False
+
+        # Save the resume cursor before the items are processed, like the
+        # cursor fallback for pull requests and issues.
+        if page.has_next_page:
+            checkpoint.discussion_cursor = page.end_cursor
+        else:
+            checkpoint.discussion_cursor = None
+
+        done_with_discussions = False
+        num_discussions = 0
+        for discussion_ref in page.discussions:
+            num_discussions += 1
+
+            if is_slim:
+                # Slim docs exist for pruning and need no time-window filter.
+                yield Document(
+                    id=discussion_ref.url,
+                    sections=[],
+                    external_access=repo_external_access,
+                    source=DocumentSource.GITHUB,
+                    semantic_identifier="",
+                    metadata={},
+                    doc_created_at=_utc(discussion_ref.created_at),
+                )
+                continue
+
+            updated_at = _utc(discussion_ref.updated_at)
+            # Pages are newest-update first; stop once the window starts.
+            if start is not None and (updated_at is None or updated_at < start):
+                done_with_discussions = True
+                break
+            if end is not None and updated_at is not None and updated_at > end:
+                continue
+
+            try:
+                discussion: GitHubDiscussion = self._get_discussion_rate_limited(
+                    repo.full_name, discussion_ref.number
+                )
+            except Exception as e:
+                error_msg = (
+                    f"Error fetching discussion #{discussion_ref.number} "
+                    f"in {repo.full_name}: {e}"
+                )
+                logger.exception(error_msg)
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(
+                        document_id=discussion_ref.url,
+                        document_link=discussion_ref.url,
+                    ),
+                    failure_message=error_msg,
+                    exception=e,
+                )
+                continue
+
+            try:
+                yield _convert_discussion_to_document(
+                    discussion,
+                    repo.full_name,
+                    repo_external_access,
+                    self._lookup_user,
+                )
+            except Exception as e:
+                error_msg = (
+                    f"Error converting discussion #{discussion_ref.number} "
+                    f"to document: {e}"
+                )
+                logger.exception(error_msg)
+                yield ConnectorFailure(
+                    failed_document=DocumentFailure(
+                        document_id=discussion_ref.url,
+                        document_link=discussion_ref.url,
+                    ),
+                    failure_message=error_msg,
+                    exception=e,
+                )
+                continue
+
+        logger.info(
+            "Fetched %s discussions for repo: %s",
+            num_discussions,
+            repo.name,
+        )
+        if done_with_discussions:
+            checkpoint.discussion_cursor = None
+            return False
+        return page.has_next_page
+
     def _fetch_from_github(
         self,
         checkpoint: GithubConnectorCheckpoint,
@@ -1333,16 +1607,44 @@ class GithubConnector(
                 return checkpoint
 
             # if we went past the start date during the loop or there are no more
-            # issues to get, we move on to indexing files
-            checkpoint.stage = GithubConnectorStage.FILES
+            # issues to get, we move on to discussions
+            checkpoint.stage = GithubConnectorStage.DISCUSSIONS
             checkpoint.reset()
 
-        # Advance into FILES from PRS/ISSUES, but never regress a resumed FILES
-        # checkpoint (mid file-pagination) — that would null out file_paths and
-        # re-index from page 0.
+        # Advance into DISCUSSIONS from PRS/ISSUES, but never regress a resumed
+        # DISCUSSIONS or FILES checkpoint.
         if checkpoint.stage in (
             GithubConnectorStage.PRS,
             GithubConnectorStage.ISSUES,
+        ):
+            checkpoint.stage = GithubConnectorStage.DISCUSSIONS
+
+        if (
+            self.include_discussions
+            and checkpoint.stage == GithubConnectorStage.DISCUSSIONS
+        ):
+            logger.info("Fetching discussions for repo: %s", repo.name)
+            has_more_discussion_pages = yield from self._fetch_repo_discussions(
+                repo,
+                checkpoint,
+                start,
+                end,
+                is_slim,
+                repo_external_access,
+            )
+            # More discussion pages remain for this repo — checkpoint and resume.
+            if has_more_discussion_pages:
+                return checkpoint
+            checkpoint.stage = GithubConnectorStage.FILES
+            checkpoint.reset()
+
+        # Advance into FILES from the earlier stages, but never regress a
+        # resumed FILES checkpoint (mid file-pagination) — that would null out
+        # file_paths and re-index from page 0.
+        if checkpoint.stage in (
+            GithubConnectorStage.PRS,
+            GithubConnectorStage.ISSUES,
+            GithubConnectorStage.DISCUSSIONS,
         ):
             checkpoint.stage = GithubConnectorStage.FILES
 
@@ -1511,6 +1813,8 @@ class GithubConnector(
             return "pull requests are not indexed by this connector"
         if parsed.kind == GitHubDocKind.ISSUE and not self.include_issues:
             return "issues are not indexed by this connector"
+        if parsed.kind == GitHubDocKind.DISCUSSIONS and not self.include_discussions:
+            return "discussions are not indexed by this connector"
         if parsed.kind == GitHubDocKind.FILE and not self.include_files:
             return "files are not indexed by this connector"
         return None
@@ -1585,7 +1889,7 @@ class GithubConnector(
             document = _convert_pr_to_document(
                 pull_request, repo_external_access, self._lookup_user
             )
-        else:
+        elif parsed.kind == GitHubDocKind.ISSUE:
             issue = self._call_rate_limited(
                 partial(
                     self.source_operations.get_issue,
@@ -1603,6 +1907,29 @@ class GithubConnector(
             document = _convert_issue_to_document(
                 issue, repo_external_access, self._lookup_user
             )
+        elif parsed.kind == GitHubDocKind.DISCUSSIONS:
+            try:
+                discussion: GitHubDiscussion = self._call_rate_limited(
+                    partial(
+                        self.source_operations.get_discussion,
+                        repo_full_name=repo.full_name,
+                        number=parsed.number,
+                    )
+                )
+            except GitHubDiscussionsUnavailableError as e:
+                return _reindex_failure(
+                    doc_id,
+                    f"Discussions are turned off for {repo.full_name}: {e}",
+                    e,
+                )
+            document = _convert_discussion_to_document(
+                discussion,
+                repo.full_name,
+                repo_external_access,
+                self._lookup_user,
+            )
+        else:
+            raise ValueError(f"Unsupported document kind '{parsed.kind}'")
 
         if document.id != doc_id:
             # The repository was renamed or transferred; the crawl writes the
@@ -1629,7 +1956,8 @@ class GithubConnector(
                 yield _reindex_failure(
                     doc_id,
                     f"Cannot parse GitHub document id '{doc_id}'; targeted "
-                    "reindex supports pull request, issue and file URLs.",
+                    "reindex supports pull request, issue, discussion and "
+                    "file URLs.",
                 )
                 continue
             scope_error = self._reindex_scope_error(parsed)
@@ -1708,10 +2036,15 @@ class GithubConnector(
                 "Invalid connector settings: 'repo_owner' must be provided."
             )
 
-        if not (self.include_prs or self.include_issues or self.include_files):
+        if not (
+            self.include_prs
+            or self.include_issues
+            or self.include_discussions
+            or self.include_files
+        ):
             raise ConnectorValidationError(
                 "Invalid connector settings: at least one of pull requests, "
-                "issues, or files must be selected for indexing."
+                "issues, discussions, or files must be selected for indexing."
             )
 
         try:

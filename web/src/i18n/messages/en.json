@@ -3903,6 +3903,10 @@
               "label": "Include Issues",
               "description": "Index issues from repositories"
             },
+            "include_discussions": {
+              "label": "Include Discussions",
+              "description": "Index discussions, including comments and replies, from repositories"
+            },
             "include_files": {
               "label": "Include Documents",
               "description": "Index text-based documents (markdown, text, etc.) from repositories"

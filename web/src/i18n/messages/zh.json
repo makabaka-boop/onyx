@@ -3903,6 +3903,10 @@
               "label": "包含议题",
               "description": "索引仓库中的议题"
             },
+            "include_discussions": {
+              "label": "包含讨论",
+              "description": "索引仓库中的讨论，包括评论和回复"
+            },
             "include_files": {
               "label": "包含文档",
               "description": "索引仓库中的文本类文档（Markdown、文本等）"

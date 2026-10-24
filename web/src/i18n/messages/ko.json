@@ -3903,6 +3903,10 @@
               "label": "이슈 포함",
               "description": "저장소의 이슈를 인덱싱합니다"
             },
+            "include_discussions": {
+              "label": "토론 포함",
+              "description": "저장소의 토론(댓글 및 답글 포함)을 인덱싱합니다"
+            },
             "include_files": {
               "label": "문서 포함",
               "description": "저장소의 텍스트 기반 문서(마크다운, 텍스트 등)를 인덱싱합니다"

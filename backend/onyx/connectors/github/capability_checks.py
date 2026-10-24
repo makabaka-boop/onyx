@@ -48,6 +48,7 @@ from onyx.connectors.github.connector import (
     is_indexable_path,
 )
 from onyx.connectors.github.models import (
+    GitHubDiscussionPage,
     GitHubGitTree,
     GitHubIssue,
     GitHubPullRequest,
@@ -57,6 +58,7 @@ from onyx.connectors.github.models import (
 )
 from onyx.connectors.github.source_operations import (
     GitHubApiError,
+    GitHubDiscussionsUnavailableError,
     GitHubRateLimitError,
     GitHubSourceOperations,
 )
@@ -82,7 +84,9 @@ _SSO_GUIDE_LINK = (
 _OWNER_FIELDS = frozenset({"repo_owner"})
 # The config fields each check's result reads, see ``config_fields``.
 _REPOSITORY_FIELDS = _OWNER_FIELDS | {"repositories"}
-_DOCUMENT_TYPE_FIELDS = frozenset({"include_prs", "include_issues", "include_files"})
+_DOCUMENT_TYPE_FIELDS = frozenset(
+    {"include_prs", "include_issues", "include_discussions", "include_files"}
+)
 _ERROR_DETAIL_CHARS = 300
 # GitHub's text when a SAML organization has not authorized the token.
 _SAML_TEXT = "saml enforcement"
@@ -117,6 +121,7 @@ _DEPENDS_ON: dict[str, tuple[str, ...]] = {
     "github_branch": _REPOSITORY_CHECK_IDS,
     "github_pull_requests": _REPOSITORY_CHECK_IDS,
     "github_issues": _REPOSITORY_CHECK_IDS,
+    "github_discussions": _REPOSITORY_CHECK_IDS,
     "github_files": ("github_branch", *_REPOSITORY_CHECK_IDS),
     "github_repository_visibility": _REPOSITORY_CHECK_IDS,
     _COLLABORATORS_CHECK_ID: _REPOSITORY_CHECK_IDS,
@@ -438,7 +443,12 @@ class _TokenScopesCheck(_GitHubCheck):
         return CheckOutput(summary="Classic token has the repo scope")
 
 
-_DOCUMENT_TYPE_NAMES = ("pull requests", "issues", "documents")
+_DOCUMENT_TYPE_NAMES = (
+    "pull requests",
+    "issues",
+    "discussions",
+    "documents",
+)
 
 
 class _DocumentTypesCheck(_GitHubCheck):
@@ -447,7 +457,7 @@ class _DocumentTypesCheck(_GitHubCheck):
             check_id="github_document_types",
             config_fields=_DOCUMENT_TYPE_FIELDS,
             display_name="Check selected content",
-            remediation="Select pull requests, issues or files.",
+            remediation="Select pull requests, issues, discussions or files.",
             requires_fields=frozenset(),
             requires_connector_config=True,
         )
@@ -458,19 +468,24 @@ class _DocumentTypesCheck(_GitHubCheck):
             name
             for name, included in zip(
                 _DOCUMENT_TYPE_NAMES,
-                (config.include_prs, config.include_issues, config.include_files),
+                (
+                    config.include_prs,
+                    config.include_issues,
+                    config.include_discussions,
+                    config.include_files,
+                ),
                 strict=True,
             )
             if included
         ]
         if not selected:
             raise ConnectorValidationError(
-                "Pull requests, issues and files are all turned off, so the "
-                "connector indexes nothing. Select at least one.",
+                "Pull requests, issues, discussions and files are all turned "
+                "off, so the connector indexes nothing. Select at least one.",
                 summary="Nothing selected to index",
                 description=(
-                    "None of pull requests, issues or documents is selected.\n"
-                    "Select at least one."
+                    "None of pull requests, issues, discussions or documents "
+                    "is selected.\nSelect at least one."
                 ),
             )
         return CheckOutput(summary=f"Indexing {', '.join(selected)}")
@@ -1158,6 +1173,90 @@ class _IssuesCheck(_GitHubCheck):
         return CheckOutput(summary=f"Read issue #{issue.number}")
 
 
+class _DiscussionsCheck(_GitHubCheck):
+    """Lists one page of discussions of the first repository to index, and
+    reads the first one (with its comments and replies), as indexing does."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            check_id="github_discussions",
+            config_fields=_REPOSITORY_FIELDS,
+            display_name="Sample discussions",
+            remediation=(
+                "Discussions need GraphQL access. Fine-grained token: give it "
+                "read access to Discussions. Classic token: the `repo` scope for "
+                "private repositories."
+            ),
+        )
+
+    def applies(self, form_state: FormState[GithubConnectorConfig]) -> bool:
+        return form_state.config.include_discussions
+
+    def run(self, context: CapabilityCheckContext) -> CheckOutput:
+        config: GithubConnectorConfig = self.config(context)
+        repository: GitHubRepository = _probe_repository(context, config)
+        gateway: GitHubSourceOperations = _gateway(context)
+        discussion_number: int | None = None
+        try:
+            page: GitHubDiscussionPage = gateway.list_discussions_page(
+                repo_full_name=repository.full_name
+            )
+            if page.discussions:
+                discussion_number = page.discussions[0].number
+                gateway.get_discussion(
+                    repo_full_name=repository.full_name,
+                    number=discussion_number,
+                )
+        except GitHubDiscussionsUnavailableError:
+            # Discussions are turned off for the repository; indexing skips them.
+            return CheckOutput(
+                summary=f"Discussions are off in {repository.full_name}",
+                advisories=[
+                    CheckAdvisory(
+                        message=(
+                            "GitHub has discussions turned off for this "
+                            "repository, and indexing skips them."
+                        )
+                    )
+                ],
+            )
+        except GitHubApiError as e:
+            if e.status_code == 404 and not isinstance(e, GitHubRateLimitError):
+                return CheckOutput(
+                    summary=f"Discussions are off in {repository.full_name}",
+                    advisories=[
+                        CheckAdvisory(
+                            message=(
+                                "GitHub has discussions turned off for this "
+                                "repository, and indexing skips them."
+                            )
+                        )
+                    ],
+                )
+            _raise_for_api_error(
+                e,
+                denied=(
+                    f"The token cannot read the discussions of `{repository.full_name}`"
+                ),
+                denied_row=CheckRowText(
+                    summary="Token cannot read discussions",
+                    description=(
+                        "GitHub refused the token access to discussions. "
+                        "(GraphQL error)\n"
+                        + _need(context, scope="repo", permission="Discussions")
+                    ),
+                ),
+            )
+        if discussion_number is None:
+            raise InconclusiveValidationError(
+                f"`{repository.full_name}` has no discussions, so Onyx could not "
+                "read one.",
+                summary="No discussions found to test",
+                description="The first repository has no discussions.",
+            )
+        return CheckOutput(summary=f"Read discussion #{discussion_number}")
+
+
 class _FilesCheck(_GitHubCheck):
     """Lists the file tree of the first repository to index, and reads one
     file that indexing would read."""
@@ -1251,6 +1350,7 @@ def build_github_indexing_checks() -> list[CapabilityCheck]:
         _BranchCheck(),
         _PullRequestsCheck(),
         _IssuesCheck(),
+        _DiscussionsCheck(),
         _FilesCheck(),
     ]
 

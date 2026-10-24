@@ -201,7 +201,9 @@ def test_an_api_error_carries_the_request_and_body() -> None:
 
 def test_selected_content_names_what_is_indexed() -> None:
     result = _run(
-        "github_document_types", healthy_gateway(), form_config(include_issues=False)
+        "github_document_types",
+        healthy_gateway(),
+        form_config(include_issues=False, include_discussions=False),
     )
 
     assert result.summary == "Indexing pull requests, documents"

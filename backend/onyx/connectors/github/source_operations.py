@@ -15,6 +15,7 @@ import base64
 import functools
 import inspect
 import json
+import re
 import threading
 import urllib.parse
 from collections.abc import Callable, Iterator
@@ -35,6 +36,11 @@ from onyx.connectors.exceptions import SourceApiError
 from onyx.connectors.github.models import (
     GitHubBranch,
     GitHubCursorItem,
+    GitHubDiscussion,
+    GitHubDiscussionCategory,
+    GitHubDiscussionComment,
+    GitHubDiscussionPage,
+    GitHubDiscussionRef,
     GitHubFileContent,
     GitHubGitTree,
     GitHubIssue,
@@ -155,6 +161,13 @@ class GitHubRateLimitError(GitHubApiError):
             body=body,
         )
         self.secondary = secondary
+
+
+class GitHubDiscussionsUnavailableError(GitHubApiError):
+    """Discussions are turned off for the repository, or the server's GraphQL
+    schema has no discussions support. The crawl treats it like the 404 a
+    disabled issues or pull requests listing returns: it skips discussions for
+    the repository instead of failing the run."""
 
 
 def _header(headers: Any, name: str) -> str | None:
@@ -283,9 +296,238 @@ def _logins(
     return logins
 
 
+def _login(actor: Any) -> str | None:
+    """The login of a GraphQL actor (``author { login }``). GraphQL returns
+    null for an author that deleted their account."""
+    if not isinstance(actor, dict):
+        return None
+    login: Any = actor.get("login")
+    return login if isinstance(login, str) else None
+
+
 def _listing_params(state: str) -> dict[str, Any]:
     """The query of a pull request or issue listing: newest update first."""
     return {"state": state, "sort": "updated", "direction": "desc"}
+
+
+# Discussions are only available through the GraphQL API. The REST API root of
+# a GitHub Enterprise Server is /api/v3, while its GraphQL endpoint is
+# /api/graphql.
+_GHES_REST_SUFFIX = "/api/v3"
+_GHES_GRAPHQL_SUFFIX = "/api/graphql"
+_GRAPHQL_PATH = "/graphql"
+# Discussions listed per checkpoint batch; comments and replies per page.
+_DISCUSSIONS_PER_PAGE = 50
+_GRAPHQL_PAGE_SIZE = 100
+
+_LIST_DISCUSSIONS_QUERY = """
+query OnyxListDiscussions($owner: String!, $name: String!, $first: Int!, $after: String) {
+  repository(owner: $owner, name: $name) {
+    discussions(first: $first, after: $after, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { endCursor hasNextPage }
+      nodes {
+        number
+        title
+        url
+        createdAt
+        updatedAt
+        author { login }
+        category { name slug }
+      }
+    }
+  }
+}
+"""
+
+_DISCUSSION_COMMENT_FIELDS = """
+  id
+  databaseId
+  url
+  body
+  createdAt
+  updatedAt
+  author { login }
+  replyTo { databaseId }
+"""
+
+_DISCUSSION_COMMENTS_QUERY = (
+    """
+query OnyxDiscussionComments($owner: String!, $name: String!, $number: Int!,
+                              $commentsFirst: Int!, $commentsAfter: String) {
+  repository(owner: $owner, name: $name) {
+    discussion(number: $number) {
+      number
+      title
+      body
+      url
+      createdAt
+      updatedAt
+      author { login }
+      category { name slug }
+      answerChosenAt
+      answerChosenBy { login }
+      answer { id }
+      comments(first: $commentsFirst, after: $commentsAfter) {
+        pageInfo { endCursor hasNextPage }
+        nodes {
+"""
+    + _DISCUSSION_COMMENT_FIELDS
+    + """
+          replies(first: """
+    + str(_GRAPHQL_PAGE_SIZE)
+    + """) {
+            pageInfo { endCursor hasNextPage }
+            nodes {
+"""
+    + _DISCUSSION_COMMENT_FIELDS
+    + """
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+_COMMENT_REPLIES_QUERY = (
+    """
+query OnyxCommentReplies($commentId: ID!, $first: Int!, $after: String) {
+  node(id: $commentId) {
+    ... on DiscussionComment {
+      replies(first: $first, after: $after) {
+        pageInfo { endCursor hasNextPage }
+        nodes {
+"""
+    + _DISCUSSION_COMMENT_FIELDS
+    + """
+        }
+      }
+    }
+  }
+}
+"""
+)
+
+_DISCUSSIONS_DISABLED_RE = re.compile(
+    r"discussions? (?:are|is) not enabled|"
+    r"field ['\"]discussions?['\"] .*doesn't exist",
+    re.IGNORECASE,
+)
+_GRAPHQL_RATE_LIMIT_RE = re.compile(r"rate limit|abuse", re.IGNORECASE)
+_GRAPHQL_SECONDARY_RATE_LIMIT_RE = re.compile(
+    r"secondary rate limit|abuse", re.IGNORECASE
+)
+
+
+def _split_repo_full_name(repo_full_name: str) -> tuple[str, str]:
+    owner, _, name = repo_full_name.partition("/")
+    return owner, name
+
+
+def _discussion_category(raw: Any) -> GitHubDiscussionCategory | None:
+    if not isinstance(raw, dict):
+        return None
+    name: Any = raw.get("name")
+    if not isinstance(name, str):
+        return None
+    slug: Any = raw.get("slug")
+    return GitHubDiscussionCategory(
+        name=name, slug=slug if isinstance(slug, str) else None
+    )
+
+
+def _discussion_ref(raw: dict[str, Any]) -> GitHubDiscussionRef:
+    return GitHubDiscussionRef(
+        number=raw["number"],
+        title=raw.get("title") or "",
+        url=raw["url"],
+        created_at=raw.get("createdAt"),
+        updated_at=raw.get("updatedAt"),
+        author_login=_login(raw.get("author")),
+        category=_discussion_category(raw.get("category")),
+    )
+
+
+def _discussion_comment(raw: dict[str, Any]) -> GitHubDiscussionComment:
+    """One comment with the replies the current page carries."""
+    reply_to: Any = raw.get("replyTo")
+    replies_connection: Any = raw.get("replies")
+    reply_nodes: list[Any] = (
+        replies_connection.get("nodes")
+        if isinstance(replies_connection, dict)
+        and isinstance(replies_connection.get("nodes"), list)
+        else []
+    )
+    return GitHubDiscussionComment(
+        id=raw["id"],
+        database_id=raw.get("databaseId"),
+        url=raw.get("url"),
+        body=raw.get("body"),
+        created_at=raw.get("createdAt"),
+        updated_at=raw.get("updatedAt"),
+        author_login=_login(raw.get("author")),
+        reply_to_id=(
+            reply_to.get("databaseId") if isinstance(reply_to, dict) else None
+        ),
+        replies=[
+            _discussion_comment(reply)
+            for reply in reply_nodes
+            if isinstance(reply, dict) and reply.get("id")
+        ],
+    )
+
+
+def _discussion_replies_page_info(raw: dict[str, Any]) -> tuple[str | None, bool]:
+    """The replies paging state of a comment node of a comments page."""
+    replies_connection: Any = raw.get("replies")
+    page_info: Any = (
+        replies_connection.get("pageInfo")
+        if isinstance(replies_connection, dict)
+        else None
+    )
+    if not isinstance(page_info, dict):
+        return None, False
+    end_cursor: Any = page_info.get("endCursor")
+    return (
+        end_cursor if isinstance(end_cursor, str) else None,
+        bool(page_info.get("hasNextPage")),
+    )
+
+
+def _graphql_error_messages(errors: Any) -> list[str]:
+    if not isinstance(errors, list):
+        return []
+    return [
+        error["message"]
+        for error in errors
+        if isinstance(error, dict) and isinstance(error.get("message"), str)
+    ]
+
+
+def _is_discussions_unavailable(errors: Any) -> bool:
+    return any(
+        bool(_DISCUSSIONS_DISABLED_RE.search(message))
+        for message in _graphql_error_messages(errors)
+    )
+
+
+def _graphql_rate_limit(errors: Any) -> GitHubRateLimitError | None:
+    messages = _graphql_error_messages(errors)
+    if not any(_GRAPHQL_RATE_LIMIT_RE.search(message) for message in messages):
+        return None
+    secondary = any(
+        bool(_GRAPHQL_SECONDARY_RATE_LIMIT_RE.search(message)) for message in messages
+    )
+    detail = "; ".join(messages)
+    return GitHubRateLimitError(
+        detail,
+        status_code=None,
+        github_message=detail,
+        secondary=secondary,
+        method="POST",
+    )
 
 
 class GitHubSourceOperations(SourceOperations):
@@ -381,6 +623,81 @@ class GitHubSourceOperations(SourceOperations):
             page_params["page"] = page + 1
         _headers, data = self._get(url, page_params)
         return [raw for raw in (data if isinstance(data, list) else []) if raw]
+
+    def _graphql_url(self) -> str:
+        """The GraphQL endpoint. A GitHub Enterprise Server serves it at
+        /api/graphql, next to the /api/v3 REST root."""
+        base_url: str = self._client().requester.base_url
+        if base_url.endswith(_GHES_REST_SUFFIX):
+            return base_url[: -len(_GHES_REST_SUFFIX)] + _GHES_GRAPHQL_SUFFIX
+        return base_url + _GRAPHQL_PATH
+
+    def _graphql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        """One GraphQL call. Returns the ``data`` object.
+
+        GraphQL answers HTTP 200 with an ``errors`` array for a rejected
+        field (a turned-off feature, a missing grant, the rate limit), so the
+        HTTP success status is not enough.
+        """
+        url: str = self._graphql_url()
+        try:
+            _headers, data = self._client().requester.requestJsonAndCheck(
+                "POST", url, input={"query": query, "variables": variables}
+            )
+        except GithubException as error:
+            translated: GitHubApiError = _translate(error, method="POST", url=url)
+            # GitHub answers a secondary GraphQL rate limit with HTTP 402.
+            if error.status == 402 and not isinstance(translated, GitHubRateLimitError):
+                raise GitHubRateLimitError(
+                    str(error),
+                    status_code=error.status,
+                    github_message=_github_message(error),
+                    secondary=True,
+                    method="POST",
+                    url=url,
+                    body=_body(error),
+                ) from error
+            raise translated from error
+
+        if not isinstance(data, dict):
+            raise GitHubApiError(
+                "GitHub GraphQL returned no JSON object",
+                status_code=None,
+                method="POST",
+                url=url,
+            )
+        errors: Any = data.get("errors")
+        if errors:
+            if _is_discussions_unavailable(errors):
+                detail = "; ".join(_graphql_error_messages(errors))
+                raise GitHubDiscussionsUnavailableError(
+                    detail,
+                    status_code=None,
+                    github_message=detail,
+                    method="POST",
+                    url=url,
+                )
+            rate_limit_error: GitHubRateLimitError | None = _graphql_rate_limit(errors)
+            if rate_limit_error is not None:
+                rate_limit_error.url = url
+                raise rate_limit_error
+            detail = "; ".join(_graphql_error_messages(errors)) or str(errors)
+            raise GitHubApiError(
+                detail,
+                status_code=None,
+                github_message=detail,
+                method="POST",
+                url=url,
+            )
+        payload: Any = data.get("data")
+        if not isinstance(payload, dict):
+            raise GitHubApiError(
+                "GitHub GraphQL returned no data",
+                status_code=None,
+                method="POST",
+                url=url,
+            )
+        return payload
 
     def _list_repositories(self, url: str, limit: int | None) -> list[GitHubRepository]:
         repositories: list[GitHubRepository] = []
@@ -625,6 +942,177 @@ class GitHubSourceOperations(SourceOperations):
         """One issue with the fields a listing leaves out (closed by)."""
         _headers, data = self._get(f"/repos/{repo_full_name}/issues/{number}")
         return GitHubIssue.from_raw(data, repo_full_name=repo_full_name, detailed=True)
+
+    @source_operation(
+        capabilities={CredentialCapability.INDEXING},
+        consumes=OperationConsumes.BOTH,
+    )
+    @_translated
+    def list_discussions_page(
+        self, *, repo_full_name: str, after: str | None = None
+    ) -> GitHubDiscussionPage:
+        """One cursor page of discussions, newest activity first.
+
+        Discussions are only available through GraphQL. Raises
+        ``GitHubDiscussionsUnavailableError`` when the repository has
+        discussions turned off or the server does not support them.
+        """
+        owner, name = _split_repo_full_name(repo_full_name)
+        payload: dict[str, Any] = self._graphql(
+            _LIST_DISCUSSIONS_QUERY,
+            {
+                "owner": owner,
+                "name": name,
+                "first": _DISCUSSIONS_PER_PAGE,
+                "after": after,
+            },
+        )
+        repository: Any = payload.get("repository")
+        if not isinstance(repository, dict):
+            raise GitHubApiError(
+                f"Cannot read repository {repo_full_name}",
+                status_code=404,
+            )
+        discussions_connection: Any = repository.get("discussions")
+        if not isinstance(discussions_connection, dict):
+            # The token can read the repository but not its discussions.
+            raise GitHubApiError(
+                f"Cannot read discussions of {repo_full_name}",
+                status_code=None,
+            )
+        page_info: Any = discussions_connection.get("pageInfo") or {}
+        end_cursor: Any = page_info.get("endCursor")
+        nodes: Any = discussions_connection.get("nodes")
+        return GitHubDiscussionPage(
+            discussions=[
+                _discussion_ref(node)
+                for node in (nodes if isinstance(nodes, list) else [])
+                if isinstance(node, dict) and node.get("number") is not None
+            ],
+            end_cursor=end_cursor if isinstance(end_cursor, str) else None,
+            has_next_page=bool(page_info.get("hasNextPage")),
+        )
+
+    def _discussion_comment_with_all_replies(
+        self, raw_comment: dict[str, Any]
+    ) -> GitHubDiscussionComment:
+        """One top-level comment with the replies of every page.
+
+        The comments query carries only the first replies page. The remaining
+        replies are read through the comment node's ``replies`` connection.
+        """
+        comment: GitHubDiscussionComment = _discussion_comment(raw_comment)
+        end_cursor, has_next_page = _discussion_replies_page_info(raw_comment)
+        while has_next_page:
+            replies_payload: dict[str, Any] = self._graphql(
+                _COMMENT_REPLIES_QUERY,
+                {
+                    "commentId": comment.id,
+                    "first": _GRAPHQL_PAGE_SIZE,
+                    "after": end_cursor,
+                },
+            )
+            node: Any = replies_payload.get("node")
+            replies_connection: Any = (
+                node.get("replies") if isinstance(node, dict) else None
+            )
+            if not isinstance(replies_connection, dict):
+                break
+            reply_nodes: Any = replies_connection.get("nodes")
+            comment.replies.extend(
+                _discussion_comment(reply)
+                for reply in (reply_nodes if isinstance(reply_nodes, list) else [])
+                if isinstance(reply, dict) and reply.get("id")
+            )
+            replies_page_info: Any = replies_connection.get("pageInfo") or {}
+            next_cursor: Any = replies_page_info.get("endCursor")
+            end_cursor = next_cursor if isinstance(next_cursor, str) else None
+            has_next_page = bool(replies_page_info.get("hasNextPage"))
+        return comment
+
+    @source_operation(
+        capabilities={CredentialCapability.INDEXING},
+        consumes=OperationConsumes.BOTH,
+    )
+    @_translated
+    def get_discussion(self, *, repo_full_name: str, number: int) -> GitHubDiscussion:
+        """One discussion with every comment and reply, paging comments and
+        the replies of each comment to the end.
+
+        Raises ``GitHubApiError`` (404) for a missing discussion and
+        ``GitHubDiscussionsUnavailableError`` when discussions are turned off.
+        """
+        owner, name = _split_repo_full_name(repo_full_name)
+        comments: list[GitHubDiscussionComment] = []
+        core: dict[str, Any] | None = None
+        answer_id: str | None = None
+        answer_chosen_at: Any = None
+        answer_chosen_by_login: str | None = None
+        comments_after: str | None = None
+        while True:
+            payload: dict[str, Any] = self._graphql(
+                _DISCUSSION_COMMENTS_QUERY,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": number,
+                    "commentsFirst": _GRAPHQL_PAGE_SIZE,
+                    "commentsAfter": comments_after,
+                },
+            )
+            repository: Any = payload.get("repository")
+            discussion: Any = (
+                repository.get("discussion") if isinstance(repository, dict) else None
+            )
+            if not isinstance(discussion, dict):
+                raise GitHubApiError(
+                    f"Discussion #{number} not found in {repo_full_name}",
+                    status_code=404,
+                )
+            if core is None:
+                core = discussion
+            # The answer fields sit on the discussion object, so every
+            # comments page repeats them; read them on every page because the
+            # chosen answer comment can be on a later page.
+            answer: Any = discussion.get("answer")
+            if isinstance(answer, dict) and isinstance(answer.get("id"), str):
+                answer_id = answer["id"]
+            answer_chosen_at = discussion.get("answerChosenAt")
+            answer_chosen_by_login = _login(discussion.get("answerChosenBy"))
+            comments_connection: Any = discussion.get("comments")
+            if not isinstance(comments_connection, dict):
+                break
+            comment_nodes: Any = comments_connection.get("nodes")
+            for raw_comment in comment_nodes if isinstance(comment_nodes, list) else []:
+                if not isinstance(raw_comment, dict) or not raw_comment.get("id"):
+                    continue
+                comments.append(self._discussion_comment_with_all_replies(raw_comment))
+            comments_page_info: Any = comments_connection.get("pageInfo") or {}
+            if not comments_page_info.get("hasNextPage"):
+                break
+            next_cursor: Any = comments_page_info.get("endCursor")
+            comments_after = next_cursor if isinstance(next_cursor, str) else None
+            if comments_after is None:
+                break
+
+        if core is None:
+            raise GitHubApiError(
+                f"Discussion #{number} not found in {repo_full_name}",
+                status_code=404,
+            )
+        if answer_id is not None:
+            for comment in comments:
+                if comment.id == answer_id:
+                    comment.is_accepted_answer = True
+        ref: GitHubDiscussionRef = _discussion_ref(core)
+        return GitHubDiscussion(
+            **ref.model_dump(),
+            body=core.get("body"),
+            comments=comments,
+            answer_comment_id=answer_id,
+            answer_chosen_at=answer_chosen_at,
+            answer_chosen_by_login=answer_chosen_by_login,
+        )
 
     @source_operation(
         capabilities={CredentialCapability.INDEXING},

@@ -248,11 +248,67 @@ class GitHubTokenInfo(BaseModel):
     scopes: list[str] | None = None
 
 
+class GitHubDiscussionCategory(BaseModel):
+    name: str
+    slug: str | None = None
+
+
+class GitHubDiscussionComment(BaseModel):
+    # The global GraphQL node id. The replies connection of one comment is
+    # paged through ``node(id:)``, so the gateway keeps it.
+    id: str
+    database_id: int | None = None
+    url: str | None = None
+    body: str | None = None
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    author_login: str | None = None
+    # databaseId of the comment this one replies to.
+    reply_to_id: int | None = None
+    replies: list["GitHubDiscussionComment"] = Field(default_factory=list)
+    # Set on the top-level comment chosen as the discussion's answer.
+    is_accepted_answer: bool = False
+
+
+class GitHubDiscussionRef(BaseModel):
+    """One discussion of a listing page, without its comments."""
+
+    number: int
+    title: str
+    url: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    author_login: str | None = None
+    category: GitHubDiscussionCategory | None = None
+
+
+class GitHubDiscussion(GitHubDiscussionRef):
+    """One discussion with every comment and reply."""
+
+    body: str | None = None
+    comments: list[GitHubDiscussionComment] = Field(default_factory=list)
+    # Global node id of the chosen answer comment. None when no answer is
+    # chosen.
+    answer_comment_id: str | None = None
+    answer_chosen_at: datetime | None = None
+    answer_chosen_by_login: str | None = None
+
+
+class GitHubDiscussionPage(BaseModel):
+    """One cursor page of discussions, newest activity first."""
+
+    discussions: list[GitHubDiscussionRef]
+    # Cursor of the page after this one. None when the listing is drained.
+    end_cursor: str | None = None
+    has_next_page: bool = False
+
+
 class GitHubDocKind(str, Enum):
     """The document types the connector writes, by their URL segment."""
 
     PULL_REQUEST = "pull"
     ISSUE = "issues"
+    DISCUSSIONS = "discussions"
     FILE = "blob"
 
 

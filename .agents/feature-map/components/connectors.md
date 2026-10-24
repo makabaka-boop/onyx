@@ -473,6 +473,14 @@ sign-in depends on it. They also share the row text of the errors that
 Error Details show them.
 The GitHub gateway calls the REST API through PyGithub's requester and parses the
 JSON into the models in `github/models.py`, so no PyGithub object leaves it.
+Discussions go through the GraphQL API on the same requester instead
+(`list_discussions_page`, `get_discussion`): the discussion list, every comments
+page and each comment's nested replies page to completion, with the accepted
+answer id marked from the discussion object. GraphQL returns HTTP 200 with an
+`errors` array, so the gateway inspects it explicitly; a repository with
+Discussions turned off raises `GitHubDiscussionsUnavailableError`, which the
+connector treats as "no discussions" rather than a failure. On GitHub Enterprise
+Server the GraphQL endpoint is `/api/graphql`, not the REST root `/api/v3`.
 Its `GitHubApiError` is a `SourceApiError` that carries the request and the
 response body, so a check's Error Details show them.
 

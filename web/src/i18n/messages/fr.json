@@ -3903,6 +3903,10 @@
               "label": "Inclure les tickets",
               "description": "Indexer les tickets des dépôts"
             },
+            "include_discussions": {
+              "label": "Inclure les discussions",
+              "description": "Indexer les discussions, y compris les commentaires et les réponses, des dépôts"
+            },
             "include_files": {
               "label": "Inclure les documents",
               "description": "Indexer les documents textuels (markdown, texte, etc.) des dépôts"

@@ -17,8 +17,11 @@ from onyx.connectors.exceptions import ConnectorValidationError
 from onyx.connectors.github.capability_checks import build_github_indexing_checks
 from onyx.connectors.github.config import REPOSITORY_OWNER_ERROR, GithubConnectorConfig
 from onyx.connectors.github.connector import GithubConnector
-from onyx.connectors.github.models import GitHubBranch
-from onyx.connectors.github.source_operations import GitHubRateLimitError
+from onyx.connectors.github.models import GitHubBranch, GitHubDiscussionPage
+from onyx.connectors.github.source_operations import (
+    GitHubDiscussionsUnavailableError,
+    GitHubRateLimitError,
+)
 from tests.unit.onyx.connectors.github.github_check_helpers import (
     CLASSIC_PUBLIC_ONLY_TOKEN,
     FINE_GRAINED_TOKEN,
@@ -168,7 +171,12 @@ def test_document_types_fail_when_nothing_is_selected() -> None:
     result = _run(
         "github_document_types",
         healthy_gateway(),
-        form_config(include_prs=False, include_issues=False, include_files=False),
+        form_config(
+            include_prs=False,
+            include_issues=False,
+            include_discussions=False,
+            include_files=False,
+        ),
     )
 
     assert result.status == CapabilityCheckStatus.FAILED
@@ -427,6 +435,66 @@ def test_issues_name_the_missing_fine_grained_permission() -> None:
 
     assert result.status == CapabilityCheckStatus.FAILED
     assert "`issues=read`" in result.message
+
+
+# --- github_discussions ---
+
+
+def test_discussions_read_the_first_discussion() -> None:
+    gateway = healthy_gateway()
+
+    assert _run("github_discussions", gateway).status == CapabilityCheckStatus.PASSED
+    gateway.list_discussions_page.assert_called_once_with(repo_full_name="acme/docs")
+    gateway.get_discussion.assert_called_once_with(repo_full_name="acme/docs", number=1)
+
+
+def test_discussions_check_does_not_apply_when_the_toggle_is_off() -> None:
+    gateway = healthy_gateway()
+
+    result = _run(
+        "github_discussions",
+        gateway,
+        form_config(include_discussions=False),
+    )
+
+    assert not result.applicable
+    gateway.list_discussions_page.assert_not_called()
+
+
+def test_discussions_pass_with_an_advisory_when_turned_off() -> None:
+    gateway = healthy_gateway()
+    gateway.list_discussions_page.side_effect = GitHubDiscussionsUnavailableError(
+        "Discussions are not enabled for this repository", status_code=None
+    )
+
+    result = _run("github_discussions", gateway)
+
+    assert result.status == CapabilityCheckStatus.PASSED
+    assert result.advisories
+    assert "turned off" in result.advisories[0].message
+
+
+def test_discussions_are_incomplete_when_none_exist() -> None:
+    gateway = healthy_gateway()
+    gateway.list_discussions_page.return_value = GitHubDiscussionPage(discussions=[])
+
+    result = _run("github_discussions", gateway)
+
+    assert result.status == CapabilityCheckStatus.INCOMPLETE
+    assert result.summary == "No discussions found to test"
+
+
+def test_discussions_fail_when_the_token_is_denied() -> None:
+    gateway = healthy_gateway()
+    gateway.list_discussions_page.side_effect = api_error(
+        403, "Resource not accessible by personal access token"
+    )
+
+    result = _run("github_discussions", gateway)
+
+    assert result.status == CapabilityCheckStatus.FAILED
+    assert result.error_type == "InsufficientPermissionsError"
+    assert "discussions" in result.message.lower()
 
 
 def test_files_read_one_indexable_file() -> None:

@@ -3903,6 +3903,10 @@
               "label": "Issues einbeziehen",
               "description": "Issues aus Repositories indexieren"
             },
+            "include_discussions": {
+              "label": "Discussions einbeziehen",
+              "description": "Discussions, einschließlich Kommentaren und Antworten, aus Repositories indexieren"
+            },
             "include_files": {
               "label": "Dokumente einbeziehen",
               "description": "Textbasierte Dokumente (Markdown, Text usw.) aus Repositories indexieren"

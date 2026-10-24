@@ -4,6 +4,9 @@ from typing import Any
 from unittest.mock import MagicMock, create_autospec
 
 from onyx.connectors.github.models import (
+    GitHubDiscussion,
+    GitHubDiscussionPage,
+    GitHubDiscussionRef,
     GitHubGitTree,
     GitHubIssue,
     GitHubPullRequest,
@@ -52,6 +55,25 @@ def make_issue(number: int, is_pull_request: bool = False) -> GitHubIssue:
     )
 
 
+def make_discussion_ref(number: int = 1) -> GitHubDiscussionRef:
+    return GitHubDiscussionRef(
+        number=number,
+        title="Discussion",
+        url=f"https://github.com/acme/docs/discussions/{number}",
+        updated_at="2024-01-01T00:00:00Z",
+    )
+
+
+def make_discussion(number: int = 1) -> GitHubDiscussion:
+    return GitHubDiscussion(
+        number=number,
+        title="Discussion",
+        body="Body",
+        url=f"https://github.com/acme/docs/discussions/{number}",
+        updated_at="2024-01-01T00:00:00Z",
+    )
+
+
 def healthy_gateway() -> MagicMock:
     """An organization ``acme`` with one repository ``docs`` that has a pull
     request, an issue and a README, read with a classic token."""
@@ -62,6 +84,10 @@ def healthy_gateway() -> MagicMock:
     gateway.get_repository.side_effect = lambda *, owner, name: make_repo(name)  # noqa: ARG005
     gateway.list_pull_requests.return_value = [_pr()]
     gateway.list_issues.return_value = [make_issue(1)]
+    gateway.list_discussions_page.return_value = GitHubDiscussionPage(
+        discussions=[make_discussion_ref()]
+    )
+    gateway.get_discussion.return_value = make_discussion()
     gateway.get_git_tree.return_value = GitHubGitTree(
         entries=[
             GitHubTreeEntry(path="src/main.py", type="blob", size=10),
@@ -78,6 +104,7 @@ def form_config(**overrides: Any) -> dict[str, Any]:
         "repositories": "",
         "include_prs": True,
         "include_issues": True,
+        "include_discussions": True,
         "include_files": True,
         "branch": "",
         **overrides,

@@ -3903,6 +3903,10 @@
               "label": "Issue を含める",
               "description": "リポジトリの Issue をインデックスします"
             },
+            "include_discussions": {
+              "label": "ディスカッションを含める",
+              "description": "リポジトリのディスカッション（コメントと返信を含む）をインデックスします"
+            },
             "include_files": {
               "label": "ドキュメントを含める",
               "description": "リポジトリのテキストベースのドキュメント(Markdown、テキストなど)をインデックスします"

@@ -7,6 +7,8 @@ import pytest
 
 from onyx.connectors.github.connector import GithubConnector
 from onyx.connectors.github.models import (
+    GitHubDiscussion,
+    GitHubDiscussionPage,
     GitHubIssue,
     GitHubPullRequest,
     GitHubRepository,
@@ -45,6 +47,7 @@ class KnownItems:
     def __init__(self) -> None:
         self.pull_requests: dict[tuple[str, int], GitHubPullRequest] = {}
         self.issues: dict[tuple[str, int], GitHubIssue] = {}
+        self.discussions: dict[tuple[str, int], GitHubDiscussion] = {}
 
 
 @pytest.fixture
@@ -72,6 +75,10 @@ def mock_source_operations(known_items: KnownItems) -> MagicMock:
         known_items.issues[(repo_full_name, number)].model_copy(
             update={"detailed": True}
         )
+    )
+    gateway.list_discussions_page.return_value = GitHubDiscussionPage(discussions=[])
+    gateway.get_discussion.side_effect = lambda *, repo_full_name, number: (
+        known_items.discussions[(repo_full_name, number)]
     )
     return gateway
 
@@ -149,6 +156,33 @@ def create_issue(known_items: KnownItems) -> Callable[..., GitHubIssue]:
 
 
 @pytest.fixture
+def create_discussion(known_items: KnownItems) -> Callable[..., GitHubDiscussion]:
+    def _create_discussion(
+        number: int = 1,
+        title: str = "Test Discussion",
+        body: str = "Discussion body",
+        repo_full_name: str = "test-org/test-repo",
+        updated_at: datetime = datetime(2023, 1, 1, tzinfo=timezone.utc),
+        author_login: str = "octocat",
+        **overrides: Any,
+    ) -> GitHubDiscussion:
+        discussion = GitHubDiscussion(
+            number=number,
+            title=title,
+            body=body,
+            url=f"https://github.com/{repo_full_name}/discussions/{number}",
+            created_at=updated_at,
+            updated_at=updated_at,
+            author_login=author_login,
+            **overrides,
+        )
+        known_items.discussions[(repo_full_name, number)] = discussion
+        return discussion
+
+    return _create_discussion
+
+
+@pytest.fixture
 def build_github_connector(
     mock_source_operations: MagicMock,
 ) -> Callable[..., GithubConnector]:
@@ -158,6 +192,7 @@ def build_github_connector(
         include_prs: bool = True,
         include_issues: bool = True,
         include_files: bool = False,
+        include_discussions: bool = False,
         branch: str | None = None,
     ) -> GithubConnector:
         connector = GithubConnector(
@@ -166,6 +201,7 @@ def build_github_connector(
             include_prs=include_prs,
             include_issues=include_issues,
             include_files=include_files,
+            include_discussions=include_discussions,
             branch=branch,
         )
         connector._source_operations = mock_source_operations

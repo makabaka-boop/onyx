@@ -30,6 +30,7 @@ class GithubConnectorConfig(ConnectorConfig):
     )
     include_prs: Annotated[bool, _DOCUMENT_TYPE_TOGGLE] = True
     include_issues: Annotated[bool, _DOCUMENT_TYPE_TOGGLE] = False
+    include_discussions: Annotated[bool, _DOCUMENT_TYPE_TOGGLE] = False
     include_files: Annotated[bool, _DOCUMENT_TYPE_TOGGLE] = False
     # File document ids contain the branch.
     branch: Annotated[str | None, FieldPolicy(FieldClass.IDENTITY)] = None

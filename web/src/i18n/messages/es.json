@@ -3903,6 +3903,10 @@
               "label": "Incluir issues",
               "description": "Indexa los issues de los repositorios"
             },
+            "include_discussions": {
+              "label": "Incluir discusiones",
+              "description": "Indexa las discusiones, incluidos los comentarios y respuestas, de los repositorios"
+            },
             "include_files": {
               "label": "Incluir documentos",
               "description": "Indexa documentos basados en texto (markdown, texto, etc.) de los repositorios"
