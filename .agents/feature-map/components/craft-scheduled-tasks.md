@@ -4,15 +4,16 @@
 > by hand. Each fire creates a brand-new headless session, runs the agent
 > without anyone watching, and records what happened for later review.
 
-**Verified against:** `268e4d5a3d` (2026-10-05)
+**Verified against:** `268e4d5a3d` (2026-10-05), cancel feature updated 2026-10-24
 **Domain:** craft
 **Edition:** CE
 **Owns:**
 `backend/onyx/server/features/build/scheduled_tasks/` (`api.py`,
-`executor.py`, `schedule.py`), `backend/onyx/db/scheduled_task.py`,
+`executor.py`, `schedule.py`, `cancel.py`), `backend/onyx/db/scheduled_task.py`,
 `backend/onyx/background/celery/apps/scheduled_tasks.py`,
 `backend/onyx/background/celery/tasks/scheduled_tasks/tasks.py`,
-`backend/onyx/background/celery/configs/scheduled_tasks.py`
+`backend/onyx/background/celery/configs/scheduled_tasks.py`,
+`web/src/app/craft/v1/tasks/` (run history table and cancel button)
 
 **Read first:** `docs/craft/features/scheduled-tasks/overview.md`. It is the
 product plan and architecture diagram this document maps to code and

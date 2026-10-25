@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "Esta execução agendada aguarda aprovação. As mensagens de acompanhamento serão desbloqueadas depois que ela for retomada e concluída.",
+        "cancelled": "Esta execução agendada foi cancelada.",
+        "cancelling": "Esta execução agendada está sendo cancelada.",
         "running": "Esta execução agendada ainda está em andamento. As mensagens de acompanhamento serão desbloqueadas quando ela terminar.",
         "startedBy": "Esta sessão foi iniciada pela tarefa agendada {task} às {time}."
       },
@@ -15267,7 +15269,19 @@
         "title": "Nova tarefa agendada"
       },
       "runHistory": {
+        "cancel": {
+          "button": "Cancelar execução",
+          "cancellingButton": "Cancelando…",
+          "cancellingTooltip": "A sessão está parando. Clique para enviar a solicitação de parada novamente.",
+          "toasts": {
+            "cancelled": "Execução cancelada.",
+            "requestFailed": "Não foi possível cancelar a execução. Tente novamente.",
+            "stopping": "Solicitação de parada enviada. A execução aparece como cancelada após a sessão parar."
+          },
+          "tooltip": "Cancele esta execução. O agendamento da tarefa e as outras execuções não mudam."
+        },
         "columns": {
+          "actions": "Ações",
           "duration": "Duração",
           "started": "Início",
           "status": "Status",
@@ -15286,6 +15300,7 @@
           "loadingButton": "Carregando..."
         },
         "nonClickable": {
+          "cancelled": "Esta execução foi cancelada antes de criar uma sessão, portanto não há nada para abrir.",
           "noSession": "Esta execução ainda não criou uma sessão.",
           "queued": "Esta execução ainda não começou, então não há sessão para abrir.",
           "skipped": "Esta execução foi ignorada porque uma anterior ainda estava em andamento, então nenhuma sessão foi criada."

@@ -479,10 +479,15 @@ class ScheduledTaskStatus(str, PyEnum):
 class ScheduledTaskRunStatus(str, PyEnum):
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
+    # The owner requested cancellation while the agent is executing. The
+    # abort RPC has been accepted; the run settles to CANCELLED only after
+    # the executor observes the stopped turn. Still counts as in-flight.
+    CANCEL_REQUESTED = "CANCEL_REQUESTED"
     SUCCEEDED = "SUCCEEDED"
     FAILED = "FAILED"
     SKIPPED = "SKIPPED"
     AWAITING_APPROVAL = "AWAITING_APPROVAL"
+    CANCELLED = "CANCELLED"
 
     def is_terminal(self) -> bool:
         """Terminal statuses produce no further state transitions in V1."""
@@ -490,6 +495,7 @@ class ScheduledTaskRunStatus(str, PyEnum):
             ScheduledTaskRunStatus.SUCCEEDED,
             ScheduledTaskRunStatus.FAILED,
             ScheduledTaskRunStatus.SKIPPED,
+            ScheduledTaskRunStatus.CANCELLED,
         )
 
 

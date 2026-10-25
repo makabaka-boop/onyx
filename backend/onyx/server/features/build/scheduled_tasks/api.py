@@ -48,6 +48,7 @@ from onyx.db.scheduled_task import (
 from onyx.error_handling.error_codes import OnyxErrorCode
 from onyx.error_handling.exceptions import OnyxError
 from onyx.external_apps.models import AppActionPoliciesView, TaskAppActionPolicies
+from onyx.server.features.build.scheduled_tasks.cancel import cancel_scheduled_run
 from onyx.server.features.build.scheduled_tasks.schedule import (
     EDITOR_PAYLOAD_MODELS,
     EditorMode,
@@ -489,6 +490,31 @@ def run_now(
     db_session.commit()
     _enqueue_executor(run.id)
     return RunNowResponse(run_id=str(run.id), status=run.status)
+
+
+@router.post("/{task_id}/runs/{run_id}/cancel")
+def cancel_task_run(
+    task_id: UUID,
+    run_id: UUID,
+    user: User = Depends(require_permission(Permission.BASIC_ACCESS)),
+    db_session: Session = Depends(get_session),
+) -> RunSummary:
+    """Cancel one run for the caller's task.
+
+    QUEUED runs settle CANCELLED immediately and never start an agent; a
+    running run moves to CANCEL_REQUESTED, gets a confirmed abort on its own
+    session, and settles CANCELLED once the executor observes the stop. The
+    payload reflects the run's current status after the request — the UI keeps
+    refreshing the run history and treats CANCELLED (not this response) as
+    success. See ``cancel_scheduled_run`` for the error contract.
+    """
+    run = cancel_scheduled_run(
+        db_session=db_session,
+        task_id=task_id,
+        run_id=run_id,
+        user_id=user.id,
+    )
+    return RunSummary.from_model(run)
 
 
 @router.get("/{task_id}/runs")

@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "Diese geplante Ausführung wartet auf Genehmigung. Folgemeldungen werden freigeschaltet, nachdem sie fortgesetzt und abgeschlossen wurde.",
+        "cancelled": "Diese geplante Ausführung wurde abgebrochen.",
+        "cancelling": "Diese geplante Ausführung wird abgebrochen.",
         "running": "Diese geplante Ausführung läuft noch. Folgemeldungen werden freigeschaltet, sobald sie abgeschlossen ist.",
         "startedBy": "Diese Sitzung wurde von der geplanten Aufgabe {task} um {time} gestartet."
       },
@@ -15267,7 +15269,19 @@
         "title": "Neue geplante Aufgabe"
       },
       "runHistory": {
+        "cancel": {
+          "button": "Ausführung abbrechen",
+          "cancellingButton": "Wird abgebrochen…",
+          "cancellingTooltip": "Die Sitzung wird gestoppt. Klicken, um die Stoppanfrage erneut zu senden.",
+          "toasts": {
+            "cancelled": "Ausführung abgebrochen.",
+            "requestFailed": "Die Ausführung konnte nicht abgebrochen werden. Versuchen Sie es erneut.",
+            "stopping": "Stoppanfrage gesendet. Die Ausführung wird als abgebrochen angezeigt, sobald die Sitzung gestoppt ist."
+          },
+          "tooltip": "Brechen Sie diese Ausführung ab. Der Aufgabenzeitplan und andere Ausführungen ändern sich nicht."
+        },
         "columns": {
+          "actions": "Aktionen",
           "duration": "Dauer",
           "started": "Gestartet",
           "status": "Status",
@@ -15286,6 +15300,7 @@
           "loadingButton": "Wird geladen..."
         },
         "nonClickable": {
+          "cancelled": "Diese Ausführung wurde abgebrochen, bevor eine Sitzung erstellt wurde, daher gibt es nichts zu öffnen.",
           "noSession": "Dieser Lauf hat noch keine Sitzung erstellt.",
           "queued": "Dieser Lauf hat noch nicht begonnen, daher gibt es keine Sitzung zum Öffnen.",
           "skipped": "Dieser Lauf wurde übersprungen, weil ein früherer noch lief, daher wurde keine Sitzung erstellt."

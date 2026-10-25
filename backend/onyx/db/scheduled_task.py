@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import and_, desc, literal, select
+from sqlalchemy import and_, desc, func, literal, select, update
 from sqlalchemy.orm import Session, selectinload
 
 from onyx.db.action_policy import replace_task_action_policies
@@ -302,27 +302,33 @@ def advance_next_run_at(
 # ---------------------------------------------------------------------------
 
 
+# Statuses that count as a run still occupying the task's in-flight slot.
+# CANCEL_REQUESTED stays in the set until the executor settles the abort so
+# overlapping fires keep producing SKIPPED rows.
+IN_FLIGHT_RUN_STATUSES = (
+    ScheduledTaskRunStatus.QUEUED,
+    ScheduledTaskRunStatus.RUNNING,
+    ScheduledTaskRunStatus.CANCEL_REQUESTED,
+)
+
+
 def has_in_flight_run_for_task(
     *,
     db_session: Session,
     task_id: UUID,
 ) -> bool:
-    """Return True if ``task_id`` has a run currently QUEUED or RUNNING.
+    """Return True if ``task_id`` has a run currently in flight.
 
-    Used by the dispatcher to enforce SKIP_IF_RUNNING: when a prior fire is
-    still in flight, the new claim writes a ``skipped`` run row instead of
-    enqueuing the executor.
+    "In flight" covers QUEUED, RUNNING and CANCEL_REQUESTED. Used by the
+    dispatcher to enforce SKIP_IF_RUNNING: when a prior fire is still in
+    flight, the new claim writes a ``skipped`` run row instead of enqueuing
+    the executor.
     """
     stmt = (
         select(literal(1))
         .where(
             ScheduledTaskRun.task_id == task_id,
-            ScheduledTaskRun.status.in_(
-                (
-                    ScheduledTaskRunStatus.QUEUED,
-                    ScheduledTaskRunStatus.RUNNING,
-                )
-            ),
+            ScheduledTaskRun.status.in_(IN_FLIGHT_RUN_STATUSES),
         )
         .limit(1)
     )
@@ -413,6 +419,197 @@ def get_run(
     return run
 
 
+# ---------------------------------------------------------------------------
+# Run ownership + compare-and-swap (CAS) state transitions
+#
+# Every run-status transition is conditional on the current status so the
+# cancel endpoint, the executor and the stuck sweeper can never resurrect a
+# terminal row or overwrite a real result with a stale one.
+# ---------------------------------------------------------------------------
+
+
+def get_owned_run(
+    *,
+    db_session: Session,
+    task_id: UUID,
+    run_id: UUID,
+    user_id: UUID,
+) -> ScheduledTaskRun | None:
+    """Fetch a run joined through its owning task.
+
+    Returns ``None`` when the run does not exist, belongs to another task, or
+    the task is owned by another user — callers map all three to NOT_FOUND so
+    resource existence is never leaked. The ``deleted`` flag is deliberately
+    not filtered: in-flight runs survive a soft delete and stay cancellable.
+    """
+    stmt = (
+        select(ScheduledTaskRun)
+        .join(ScheduledTask, ScheduledTaskRun.task_id == ScheduledTask.id)
+        .where(
+            ScheduledTaskRun.id == run_id,
+            ScheduledTaskRun.task_id == task_id,
+            ScheduledTask.user_id == user_id,
+        )
+    )
+    return db_session.execute(stmt).scalar_one_or_none()
+
+
+def _conditional_status_update(
+    *,
+    db_session: Session,
+    run_id: UUID,
+    expected: ScheduledTaskRunStatus | tuple[ScheduledTaskRunStatus, ...],
+    new_status: ScheduledTaskRunStatus,
+    set_finished_at: bool,
+    error_class: ScheduledTaskErrorClass | None = None,
+    error_detail: str | None = None,
+    summary: str | None = None,
+) -> bool:
+    """Update a run row only when its status matches ``expected``.
+
+    Returns True when exactly one row changed. ``finished_at`` is stamped
+    when ``set_finished_at`` is True. The core UPDATE bypasses the ORM
+    identity map on purpose (the deciding process may hold a stale copy);
+    loaded objects are synchronized afterwards.
+    """
+    expected_statuses: tuple[ScheduledTaskRunStatus, ...] = (
+        expected if isinstance(expected, tuple) else (expected,)
+    )
+    values: dict[str, Any] = {"status": new_status}
+    if set_finished_at:
+        values["finished_at"] = func.now()
+    if error_class is not None:
+        values["error_class"] = error_class
+    if error_detail is not None:
+        values["error_detail"] = error_detail
+    if summary is not None:
+        values["summary"] = summary
+
+    stmt = (
+        update(ScheduledTaskRun)
+        .where(
+            ScheduledTaskRun.id == run_id,
+            ScheduledTaskRun.status.in_(expected_statuses),
+        )
+        .values(**values)
+        .execution_options(synchronize_session="fetch")
+    )
+    result = db_session.execute(stmt)
+    db_session.flush()
+    return result.rowcount == 1
+
+
+def claim_queued_run(*, db_session: Session, run_id: UUID) -> bool:
+    """Executor claim: QUEUED -> RUNNING. Fails if the run left QUEUED
+    (cancelled, already claimed by a redelivery, or swept)."""
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.QUEUED,
+        new_status=ScheduledTaskRunStatus.RUNNING,
+        set_finished_at=False,
+    )
+
+
+def fail_run_if_queued(
+    *,
+    db_session: Session,
+    run_id: UUID,
+    error_class: ScheduledTaskErrorClass,
+    error_detail: str,
+) -> bool:
+    """Mark a still-QUEUED run FAILED (sandbox-wake / task-missing paths).
+
+    A run cancelled while the sandbox was waking is already CANCELLED, so the
+    update fails and the caller skips the failure notification.
+    """
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.QUEUED,
+        new_status=ScheduledTaskRunStatus.FAILED,
+        set_finished_at=True,
+        error_class=error_class,
+        error_detail=error_detail,
+    )
+
+
+def link_run_session(
+    *, db_session: Session, run_id: UUID, session_id: UUID
+) -> None:
+    """Record the BuildSession id without changing run status.
+
+    A cancel may have moved the run to CANCEL_REQUESTED concurrently; the
+    session link must not overwrite that state.
+    """
+    run = get_run(db_session=db_session, run_id=run_id)
+    run.session_id = session_id
+    db_session.flush()
+
+
+def cancel_queued_run(*, db_session: Session, run_id: UUID) -> bool:
+    """QUEUED -> CANCELLED. The executor's claim guard then guarantees the
+    agent never starts."""
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.QUEUED,
+        new_status=ScheduledTaskRunStatus.CANCELLED,
+        set_finished_at=True,
+    )
+
+
+def request_run_cancellation(*, db_session: Session, run_id: UUID) -> bool:
+    """RUNNING -> CANCEL_REQUESTED (owner asked to stop)."""
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.RUNNING,
+        new_status=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+        set_finished_at=False,
+    )
+
+
+def revert_run_cancellation(*, db_session: Session, run_id: UUID) -> bool:
+    """CANCEL_REQUESTED -> RUNNING when the abort RPC fails, so the user can
+    see the run is still live and retry cancellation."""
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+        new_status=ScheduledTaskRunStatus.RUNNING,
+        set_finished_at=False,
+    )
+
+
+def settle_run(
+    *,
+    db_session: Session,
+    run_id: UUID,
+    expected: ScheduledTaskRunStatus | tuple[ScheduledTaskRunStatus, ...],
+    new_status: ScheduledTaskRunStatus,
+    error_class: ScheduledTaskErrorClass | None = None,
+    error_detail: str | None = None,
+    summary: str | None = None,
+) -> bool:
+    """Conditionally write a terminal status after the agent drive.
+
+    Used by the executor (SUCCEEDED / FAILED / CANCELLED) and the stuck
+    sweeper. Returns False when the row no longer matches ``expected`` — for
+    example a real result landed first — and the caller must not overwrite it.
+    """
+    return _conditional_status_update(
+        db_session=db_session,
+        run_id=run_id,
+        expected=expected,
+        new_status=new_status,
+        set_finished_at=True,
+        error_class=error_class,
+        error_detail=error_detail,
+        summary=summary,
+    )
+
+
 def list_runs_for_task(
     *,
     db_session: Session,
@@ -462,9 +659,11 @@ def find_stuck_runs(
       - its status is QUEUED and ``started_at`` is older than
         ``queued_older_than`` (worker presumably died between dispatch and
         pick-up); or
-      - its status is RUNNING and ``started_at`` is older than
-        ``running_older_than`` (worker died mid-execution or the run blew
-        past its budget without crashing).
+      - its status is RUNNING / CANCEL_REQUESTED and ``started_at`` is older
+        than ``running_older_than`` (worker died mid-execution, the run blew
+        past its budget without crashing, or an abort never reached the
+        agent). The sweeper settles CANCEL_REQUESTED rows as CANCELLED rather
+        than FAILED.
     """
     now = now or datetime.now(tz=timezone.utc)
     queued_cutoff = now - queued_older_than
@@ -476,7 +675,14 @@ def find_stuck_runs(
             & (ScheduledTaskRun.started_at < queued_cutoff)
         )
         | (
-            (ScheduledTaskRun.status == ScheduledTaskRunStatus.RUNNING)
+            (
+                ScheduledTaskRun.status.in_(
+                    (
+                        ScheduledTaskRunStatus.RUNNING,
+                        ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                    )
+                )
+            )
             & (ScheduledTaskRun.started_at < running_cutoff)
         )
     )

@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "This scheduled run is awaiting approval. Follow-up messages unlock after it resumes and finishes.",
+        "cancelled": "This scheduled run was cancelled.",
+        "cancelling": "This scheduled run is being cancelled.",
         "running": "This scheduled run is still running. Follow-up messages unlock when it finishes.",
         "startedBy": "This session was started by scheduled task {task} at {time}."
       },
@@ -15267,7 +15269,19 @@
         "title": "New Scheduled Task"
       },
       "runHistory": {
+        "cancel": {
+          "button": "Cancel run",
+          "cancellingButton": "Cancelling…",
+          "cancellingTooltip": "The session is stopping. Click to send the stop request again.",
+          "toasts": {
+            "cancelled": "Run cancelled.",
+            "requestFailed": "Could not cancel the run. Try again.",
+            "stopping": "Stop request sent. The run shows Cancelled after the session stops."
+          },
+          "tooltip": "Cancel this run. The task schedule and other runs do not change."
+        },
         "columns": {
+          "actions": "Actions",
           "duration": "Duration",
           "started": "Started",
           "status": "Status",
@@ -15286,6 +15300,7 @@
           "loadingButton": "Loading..."
         },
         "nonClickable": {
+          "cancelled": "This run was cancelled before it created a session, so there is nothing to open.",
           "noSession": "This run has not created a session yet.",
           "queued": "This run hasn't started yet, so there is no session to open.",
           "skipped": "This run was skipped because a prior run was still in flight, so no session was created."

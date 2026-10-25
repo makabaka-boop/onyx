@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "Cette exécution planifiée attend une approbation. Les messages de suivi seront débloqués après sa reprise et sa fin.",
+        "cancelled": "Cette exécution planifiée a été annulée.",
+        "cancelling": "Cette exécution planifiée est en cours d'annulation.",
         "running": "Cette exécution planifiée est toujours en cours. Les messages de suivi seront débloqués à la fin.",
         "startedBy": "Cette session a été lancée par la tâche planifiée {task} à {time}."
       },
@@ -15267,7 +15269,19 @@
         "title": "Nouvelle tâche planifiée"
       },
       "runHistory": {
+        "cancel": {
+          "button": "Annuler l'exécution",
+          "cancellingButton": "Annulation…",
+          "cancellingTooltip": "La session est en cours d'arrêt. Cliquez pour renvoyer la demande d'arrêt.",
+          "toasts": {
+            "cancelled": "Exécution annulée.",
+            "requestFailed": "Impossible d'annuler l'exécution. Réessayez.",
+            "stopping": "Demande d'arrêt envoyée. L'exécution s'affiche comme annulée une fois la session arrêtée."
+          },
+          "tooltip": "Annulez cette exécution. La planification de la tâche et les autres exécutions ne changent pas."
+        },
         "columns": {
+          "actions": "Actions",
           "duration": "Durée",
           "started": "Début",
           "status": "Statut",
@@ -15286,6 +15300,7 @@
           "loadingButton": "Chargement..."
         },
         "nonClickable": {
+          "cancelled": "Cette exécution a été annulée avant la création d'une session, il n'y a donc rien à ouvrir.",
           "noSession": "Cette exécution n'a pas encore créé de session.",
           "queued": "Cette exécution n'a pas encore commencé, il n'y a donc pas de session à ouvrir.",
           "skipped": "Cette exécution a été ignorée car une précédente était encore en cours, aucune session n'a donc été créée."

@@ -11,8 +11,10 @@ export type ScheduledTaskStatus = "ACTIVE" | "PAUSED";
 export type ScheduledTaskRunStatus =
   | "QUEUED"
   | "RUNNING"
+  | "CANCEL_REQUESTED"
   | "SUCCEEDED"
   | "FAILED"
+  | "CANCELLED"
   | "SKIPPED"
   | "AWAITING_APPROVAL";
 

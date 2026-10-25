@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "此计划运行正在等待批准。恢复并结束后即可发送后续消息。",
+        "cancelled": "此计划运行已取消。",
+        "cancelling": "此计划运行正在取消。",
         "running": "此计划运行仍在进行中。运行结束后即可发送后续消息。",
         "startedBy": "此会话由计划任务 {task} 于 {time} 启动。"
       },
@@ -15267,7 +15269,19 @@
         "title": "新建计划任务"
       },
       "runHistory": {
+        "cancel": {
+          "button": "取消本次运行",
+          "cancellingButton": "取消中…",
+          "cancellingTooltip": "会话正在停止。点击可再次发送停止请求。",
+          "toasts": {
+            "cancelled": "本次运行已取消。",
+            "requestFailed": "取消失败，请重试。",
+            "stopping": "已发送停止请求，会话停止后本次运行将显示“已取消”。"
+          },
+          "tooltip": "取消本次运行。任务计划和其他运行不受影响。"
+        },
         "columns": {
+          "actions": "操作",
           "duration": "时长",
           "started": "开始时间",
           "status": "状态",
@@ -15286,6 +15300,7 @@
           "loadingButton": "正在加载..."
         },
         "nonClickable": {
+          "cancelled": "此运行在创建会话前已取消，因此没有可打开的内容。",
           "noSession": "此运行尚未创建会话。",
           "queued": "此运行尚未开始，因此没有可打开的会话。",
           "skipped": "由于先前的运行仍在进行中，此运行被跳过，因此未创建会话。"

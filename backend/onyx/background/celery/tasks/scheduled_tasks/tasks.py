@@ -13,7 +13,8 @@ Three @shared_task wrappers, split across two queues:
   The dedicated worker exists for this task.
 - ``cleanup_stuck_scheduled_runs`` (primary queue, hourly): marks runs
   that have been QUEUED >15 min or RUNNING >45 min as
-  ``failed (stuck)``.
+  ``failed (stuck)``; CANCEL_REQUESTED runs whose abort never settled are
+  reclaimed as ``cancelled`` (no notification).
 
 Per CLAUDE.md:
 
@@ -48,7 +49,7 @@ from onyx.db.scheduled_task import (
     find_stuck_runs,
     has_in_flight_run_for_task,
     insert_run,
-    mark_run_status,
+    settle_run,
 )
 from onyx.server.features.build.timeouts import (
     QUEUE_RESIDENCY_SECONDS,
@@ -272,23 +273,39 @@ def cleanup_stuck_scheduled_runs(self: Task, *, tenant_id: str) -> int:
             running_older_than=STUCK_RUNNING_OLDER_THAN,
         )
         for run in stuck:
-            detail = (
-                f"queued > {int(STUCK_QUEUED_OLDER_THAN.total_seconds() // 60)} min"
-                if run.status == ScheduledTaskRunStatus.QUEUED
-                else "running > "
-                f"{int(STUCK_RUNNING_OLDER_THAN.total_seconds() // 60)} min"
-            )
             try:
-                mark_run_status(
+                if run.status == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+                    # The owner asked to stop but the abort never settled.
+                    # A user-initiated cancel is never a failure.
+                    changed = settle_run(
+                        db_session=db_session,
+                        run_id=run.id,
+                        expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                        new_status=ScheduledTaskRunStatus.CANCELLED,
+                    )
+                    marked += int(changed)
+                    continue
+
+                detail = (
+                    f"queued > {int(STUCK_QUEUED_OLDER_THAN.total_seconds() // 60)} min"
+                    if run.status == ScheduledTaskRunStatus.QUEUED
+                    else "running > "
+                    f"{int(STUCK_RUNNING_OLDER_THAN.total_seconds() // 60)} min"
+                )
+                changed = settle_run(
                     db_session=db_session,
                     run_id=run.id,
-                    status=ScheduledTaskRunStatus.FAILED,
+                    expected=(
+                        ScheduledTaskRunStatus.QUEUED,
+                        ScheduledTaskRunStatus.RUNNING,
+                    ),
+                    new_status=ScheduledTaskRunStatus.FAILED,
                     error_class=ScheduledTaskErrorClass.STUCK,
                     error_detail=detail,
                 )
-                marked += 1
+                marked += int(changed)
             except Exception:
-                task_logger.exception("Error marking stuck run %s as failed", run.id)
+                task_logger.exception("Error reclaiming stuck run %s", run.id)
         db_session.commit()
 
     if marked:

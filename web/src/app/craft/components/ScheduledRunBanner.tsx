@@ -60,12 +60,16 @@ export default function ScheduledRunBanner({
   const statusText =
     data.status === "RUNNING"
       ? t("status.running")
-      : data.status === "AWAITING_APPROVAL"
-        ? t("status.awaitingApproval")
-        : t("status.startedBy", {
-            task: data.task_name,
-            time: formatAbsolute(data.started_at),
-          });
+      : data.status === "CANCEL_REQUESTED"
+        ? t("status.cancelling")
+        : data.status === "CANCELLED"
+          ? t("status.cancelled")
+          : data.status === "AWAITING_APPROVAL"
+            ? t("status.awaitingApproval")
+            : t("status.startedBy", {
+                task: data.task_name,
+                time: formatAbsolute(data.started_at),
+              });
 
   return (
     <div

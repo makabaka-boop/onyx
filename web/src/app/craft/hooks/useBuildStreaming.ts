@@ -1398,7 +1398,13 @@ export function useBuildStreaming({
             continue;
           }
           if (!ownsScheduledStream() || run.run_id !== runId) return;
-          if (run.status !== "RUNNING" && run.status !== "QUEUED") {
+          // A cancel request is still in flight: keep the stream alive until
+          // the worker settles the run to CANCELLED.
+          if (
+            run.status !== "RUNNING" &&
+            run.status !== "QUEUED" &&
+            run.status !== "CANCEL_REQUESTED"
+          ) {
             await useBuildSessionStore
               .getState()
               .beginTurnSettlement(

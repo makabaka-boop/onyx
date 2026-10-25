@@ -15036,6 +15036,8 @@
       },
       "status": {
         "awaitingApproval": "Esta ejecución programada está a la espera de aprobación. Los mensajes de seguimiento se desbloquearán cuando se reanude y termine.",
+        "cancelled": "Esta ejecución programada fue cancelada.",
+        "cancelling": "Esta ejecución programada se está cancelando.",
         "running": "Esta ejecución programada sigue en curso. Los mensajes de seguimiento se desbloquearán cuando termine.",
         "startedBy": "Esta sesión fue iniciada por la tarea programada {task} a las {time}."
       },
@@ -15267,7 +15269,19 @@
         "title": "Nueva tarea programada"
       },
       "runHistory": {
+        "cancel": {
+          "button": "Cancelar ejecución",
+          "cancellingButton": "Cancelando…",
+          "cancellingTooltip": "La sesión se está deteniendo. Haz clic para volver a enviar la solicitud de detención.",
+          "toasts": {
+            "cancelled": "Ejecución cancelada.",
+            "requestFailed": "No se pudo cancelar la ejecución. Inténtalo de nuevo.",
+            "stopping": "Solicitud de detención enviada. La ejecución aparecerá como cancelada cuando se detenga la sesión."
+          },
+          "tooltip": "Cancela esta ejecución. La programación de la tarea y las demás ejecuciones no cambian."
+        },
         "columns": {
+          "actions": "Acciones",
           "duration": "Duración",
           "started": "Inicio",
           "status": "Estado",
@@ -15286,6 +15300,7 @@
           "loadingButton": "Cargando..."
         },
         "nonClickable": {
+          "cancelled": "Esta ejecución se canceló antes de crear una sesión, por lo que no hay nada que abrir.",
           "noSession": "Esta ejecución aún no ha creado una sesión.",
           "queued": "Esta ejecución aún no ha comenzado, así que no hay sesión que abrir.",
           "skipped": "Esta ejecución se omitió porque una anterior seguía en curso, así que no se creó ninguna sesión."

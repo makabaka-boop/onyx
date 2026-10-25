@@ -1000,12 +1000,21 @@ def _scheduled_run_is_running(
     session_id: UUID,
     user_id: UUID,
 ) -> bool:
+    # CANCEL_REQUESTED stays live until the executor settles the abort, so a
+    # viewer attached during the stop window keeps receiving events.
     context = get_scheduled_run_context(
         db_session=db_session,
         session_id=session_id,
         user_id=user_id,
     )
-    return context is not None and context["status"] == ScheduledTaskRunStatus.RUNNING
+    return (
+        context is not None
+        and context["status"]
+        in (
+            ScheduledTaskRunStatus.RUNNING,
+            ScheduledTaskRunStatus.CANCEL_REQUESTED,
+        )
+    )
 
 
 def _format_stream_error(detail: str) -> str:
@@ -1031,7 +1040,10 @@ def get_session_scheduled_run_events(
     )
     if context is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Session has no scheduled-run context")
-    if context["status"] != ScheduledTaskRunStatus.RUNNING:
+    if context["status"] not in (
+        ScheduledTaskRunStatus.RUNNING,
+        ScheduledTaskRunStatus.CANCEL_REQUESTED,
+    ):
         raise OnyxError(OnyxErrorCode.CONFLICT, "Scheduled run is not running")
 
     user_id = user.id

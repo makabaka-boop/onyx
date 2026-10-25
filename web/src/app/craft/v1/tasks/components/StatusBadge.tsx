@@ -10,6 +10,7 @@ import {
   SvgLoader,
   SvgPauseCircle,
   SvgPlayCircle,
+  SvgXCircle,
 } from "@opal/icons";
 import type {
   ScheduledTaskRunStatus,
@@ -92,6 +93,20 @@ function getRunStatusDisplay(status: ScheduledTaskRunStatus): RunStatusDisplay {
         icon: SvgLoader,
         className: "bg-status-info-01",
         iconClassName: "text-status-info-05 animate-spin",
+      };
+    case "CANCEL_REQUESTED":
+      return {
+        label: "Cancelling",
+        icon: SvgLoader,
+        className: "bg-status-info-01",
+        iconClassName: "text-status-info-05 animate-spin",
+      };
+    case "CANCELLED":
+      return {
+        label: "Cancelled",
+        icon: SvgXCircle,
+        className: "bg-background-tint-02",
+        iconClassName: "text-text-03",
       };
     case "QUEUED":
       return {

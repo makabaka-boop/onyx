@@ -12,6 +12,7 @@ import type {
   ScheduledTaskCreateBody,
   ScheduledTaskPatchBody,
   ScheduledRunListResponse,
+  ScheduledRunSummary,
   RunNowResponse,
 } from "@/app/craft/v1/tasks/types";
 import { BUILD_API_BASE } from "@/app/craft/v1/constants";
@@ -76,6 +77,21 @@ export async function runScheduledTaskNow(
 ): Promise<RunNowResponse> {
   const res = await fetch(`${API_BASE}/${taskId}/run-now`, { method: "POST" });
   if (!res.ok) await readError(res, "Failed to run scheduled task");
+  return await res.json();
+}
+
+// Queued runs are cancelled before the agent starts; running runs keep the
+// CANCEL_REQUESTED status until the session stop is confirmed. The returned
+// row is the source of truth — callers must not assume cancellation finished.
+export async function cancelScheduledRun(
+  taskId: string,
+  runId: string
+): Promise<ScheduledRunSummary> {
+  const res = await fetch(
+    `${API_BASE}/${taskId}/runs/${runId}/cancel`,
+    { method: "POST" }
+  );
+  if (!res.ok) await readError(res, "Failed to cancel run");
   return await res.json();
 }
 

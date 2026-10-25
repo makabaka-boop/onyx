@@ -251,7 +251,12 @@ def get_active_scheduled_task_context(
     if row is None:
         raise OnyxError(OnyxErrorCode.NOT_FOUND, "Session no longer exists")
     origin, run_id, task_id, status = row
-    if run_id is not None and status == ScheduledTaskRunStatus.RUNNING:
+    # CANCEL_REQUESTED keeps task authority until the stopped turn settles,
+    # so in-flight tool actions finish against the task's policies.
+    if run_id is not None and status in (
+        ScheduledTaskRunStatus.RUNNING,
+        ScheduledTaskRunStatus.CANCEL_REQUESTED,
+    ):
         return run_id, task_id
     if run_id is not None or origin == SessionOrigin.SCHEDULED:
         raise OnyxError(

@@ -267,6 +267,9 @@ class StubSandboxManager(SandboxManager):
         self.last_generate_document_preview_payload: dict[str, Any] | None = None
         self.last_prompt_slot: RecordingPromptSlot | None = None
         self.abort_calls: list[tuple[UUID, UUID, str]] = []
+        # When set, ``abort_opencode_session_strict`` raises it after recording
+        # the call, simulating an abort the sandbox never accepted.
+        self.abort_strict_raises: Exception | None = None
 
     # ------------------------------------------------------------------
     # send_message_events property: snapshot iterables on assignment so
@@ -635,6 +638,16 @@ class StubSandboxManager(SandboxManager):
         opencode_session_id: str,
     ) -> None:
         self.abort_calls.append((sandbox_id, session_id, opencode_session_id))
+
+    def abort_opencode_session_strict(
+        self,
+        sandbox_id: UUID,
+        session_id: UUID,
+        opencode_session_id: str,
+    ) -> None:
+        self.abort_calls.append((sandbox_id, session_id, opencode_session_id))
+        if self.abort_strict_raises is not None:
+            raise self.abort_strict_raises
 
     def subscribe_to_opencode_session(
         self,

@@ -56,18 +56,29 @@ export function formatRunDuration(
  * or `null` when the row is clickable.
  *
  * A row is clickable once there is a session to open. Queued rows have not
- * created one yet; skipped rows deliberately never create one.
+ * created one yet; skipped rows deliberately never create one. A run
+ * cancelled while queued also never creates one, so it gets its own reason.
  */
 export type RunReasonTranslate = (
-  key: "noSession" | "queued" | "skipped"
+  key: "noSession" | "queued" | "skipped" | "cancelled"
 ) => string;
 
 export function getNonClickableReason(
   run: ScheduledRunSummary,
   t: RunReasonTranslate
 ): string | null {
+  // A cancelled run linked to a session stays openable so the saved
+  // transcript remains viewable. Cancelling a queued run skips the agent, so
+  // that row never gets a session.
+  if (run.status === "CANCELLED") {
+    return run.session_id ? null : t("cancelled");
+  }
+
+  // Runs linked to a session stay openable while the cancel is in flight and
+  // for every other session-backed status.
   if (
     run.status === "RUNNING" ||
+    run.status === "CANCEL_REQUESTED" ||
     run.status === "AWAITING_APPROVAL" ||
     run.status === "SUCCEEDED" ||
     run.status === "FAILED"
@@ -87,7 +98,11 @@ export function getNonClickableReason(
 export function isScheduledRunInFlight(
   status: ScheduledTaskRunStatus
 ): boolean {
-  return status === "RUNNING" || status === "AWAITING_APPROVAL";
+  return (
+    status === "RUNNING" ||
+    status === "AWAITING_APPROVAL" ||
+    status === "CANCEL_REQUESTED"
+  );
 }
 
 export function isScheduledRunContextInFlight(

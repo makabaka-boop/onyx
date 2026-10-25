@@ -1316,6 +1316,24 @@ class OpencodeServeClient:
                 e,
             )
 
+    def abort_checked(self, opencode_session_id: str, *, directory: str) -> None:
+        """Abort the current turn and RAISE on failure.
+
+        Unlike :meth:`abort`, callers learn whether opencode actually accepted
+        the stop — the scheduled-run cancel endpoint must not report success
+        until the abort RPC is confirmed. Abort is idempotent, so cold-pod
+        retries on a dropped connection are safe.
+        """
+        r = self._request(
+            "POST",
+            f"/session/{opencode_session_id}/abort",
+            params={"directory": directory},
+            json={},
+            timeout=OPENCODE_SERVE_ABORT_TIMEOUT,
+            idempotent=True,
+        )
+        _raise_for_status(r, "session abort")
+
     def get_message(
         self, opencode_session_id: str, message_id: str, *, directory: str
     ) -> dict[str, Any] | None:

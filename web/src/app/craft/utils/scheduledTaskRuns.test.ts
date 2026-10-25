@@ -40,7 +40,14 @@ function context(status: ScheduledTaskRunStatus): ScheduledRunContextResponse {
 const tStub = ((key: string) => key) as RunReasonTranslate;
 
 describe("scheduled task run utils", () => {
-  it.each(["RUNNING", "AWAITING_APPROVAL", "SUCCEEDED", "FAILED"] as const)(
+  it.each([
+    "RUNNING",
+    "CANCEL_REQUESTED",
+    "AWAITING_APPROVAL",
+    "SUCCEEDED",
+    "FAILED",
+    "CANCELLED",
+  ] as const)(
     "allows opening %s runs with linked sessions",
     (status) => {
       expect(getNonClickableReason(run(status, "session-1"), tStub)).toBeNull();
@@ -49,21 +56,42 @@ describe("scheduled task run utils", () => {
 
   it("keeps queued and skipped runs blocked", () => {
     expect(getNonClickableReason(run("QUEUED", null), tStub)).toBe("queued");
-    expect(getNonClickableReason(run("SKIPPED", null), tStub)).toBe("skipped");
+    expect(getNonClickableReason(run("SKIPPED", null), tStub)).toBe(
+      "skipped"
+    );
   });
 
   it("blocks openable statuses until a session exists", () => {
     expect(getNonClickableReason(run("RUNNING", null), tStub)).toBe(
       "noSession"
     );
+    expect(getNonClickableReason(run("CANCEL_REQUESTED", null), tStub)).toBe(
+      "noSession"
+    );
   });
 
-  it("treats only running and awaiting-approval contexts as in-flight", () => {
+  it("blocks cancelled runs that never created a session with its own reason", () => {
+    expect(getNonClickableReason(run("CANCELLED", null), tStub)).toBe(
+      "cancelled"
+    );
+  });
+
+  it("keeps cancelled runs with a session openable", () => {
+    expect(
+      getNonClickableReason(run("CANCELLED", "session-1"), tStub)
+    ).toBeNull();
+  });
+
+  it("treats running, awaiting-approval and cancel-requested contexts as in-flight", () => {
     expect(isScheduledRunContextInFlight(context("RUNNING"))).toBe(true);
     expect(isScheduledRunContextInFlight(context("AWAITING_APPROVAL"))).toBe(
       true
     );
+    expect(isScheduledRunContextInFlight(context("CANCEL_REQUESTED"))).toBe(
+      true
+    );
     expect(isScheduledRunContextInFlight(context("SUCCEEDED"))).toBe(false);
     expect(isScheduledRunContextInFlight(context("FAILED"))).toBe(false);
+    expect(isScheduledRunContextInFlight(context("CANCELLED"))).toBe(false);
   });
 });

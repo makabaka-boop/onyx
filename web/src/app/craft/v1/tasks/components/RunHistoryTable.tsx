@@ -24,6 +24,7 @@ import { markdown } from "@opal/utils";
 import { toPlainString } from "@opal/components/text/InlineMarkdown";
 import { Section } from "@/layouts/general-layouts";
 import { listScheduledTaskRuns } from "@/app/craft/v1/tasks/api";
+import CancelRunButton from "@/app/craft/v1/tasks/components/CancelRunButton";
 import { RunStatusBadge } from "@/app/craft/v1/tasks/components/StatusBadge";
 import {
   buildSessionPath,
@@ -129,7 +130,8 @@ function SummaryCell({ row }: SummaryCellProps) {
 
 function buildColumns(
   t: RunHistoryTranslate,
-  tReason: RunReasonTranslate
+  tReason: RunReasonTranslate,
+  taskId: string
 ): TableColumn<ScheduledRunSummary>[] {
   return [
     {
@@ -205,7 +207,7 @@ function buildColumns(
       kind: "display",
       id: "summary",
       title: t("columns.summary"),
-      width: { weight: 38 },
+      width: { weight: 24 },
       cell: (row) => <SummaryCell row={row} />,
     },
     {
@@ -227,6 +229,13 @@ function buildColumns(
           </Text>
         </NonClickableCell>
       ),
+    },
+    {
+      kind: "display",
+      id: "actions",
+      title: t("columns.actions"),
+      width: { weight: 14 },
+      cell: (row) => <CancelRunButton taskId={taskId} run={row} />,
     },
   ];
 }
@@ -278,7 +287,10 @@ export default function RunHistoryTable({ taskId }: RunHistoryTableProps) {
   }, [mutate]);
 
   const tReason = useTranslations("craft.tasks.runHistory.nonClickable");
-  const columns = useMemo(() => buildColumns(t, tReason), [t, tReason]);
+  const columns = useMemo(
+    () => buildColumns(t, tReason, taskId),
+    [t, tReason, taskId]
+  );
 
   const allRuns = useMemo(() => {
     const runs: ScheduledRunSummary[] = [];

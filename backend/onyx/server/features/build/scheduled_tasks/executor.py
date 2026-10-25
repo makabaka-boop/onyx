@@ -40,11 +40,20 @@ import time
 from typing import Any
 from uuid import UUID
 
+from sqlalchemy import select
+
 from onyx.configs.constants import MessageType, NotificationType
 from onyx.db.engine.sql_engine import get_session_with_current_tenant
 from onyx.db.enums import ScheduledTaskErrorClass, ScheduledTaskRunStatus, SessionOrigin
+from onyx.db.models import ScheduledTaskRun
 from onyx.db.notification import create_notification
-from onyx.db.scheduled_task import get_run, mark_run_status
+from onyx.db.scheduled_task import (
+    claim_queued_run,
+    fail_run_if_queued,
+    get_run,
+    link_run_session,
+    settle_run,
+)
 from onyx.server.features.build.db.build_session import (
     create_message,
     get_session_messages,
@@ -167,6 +176,18 @@ def _notify(
         )
 
 
+def _current_run_status(db_session: Any, run_id: UUID) -> ScheduledTaskRunStatus | None:
+    """Read the run's status straight from the database.
+
+    A scalar column query bypasses the ORM identity map, so this sees
+    CANCEL_REQUESTED writes committed by the API process even when a run
+    object is already loaded in this session.
+    """
+    return db_session.scalar(
+        select(ScheduledTaskRun.status).where(ScheduledTaskRun.id == run_id)
+    )
+
+
 def run_scheduled_task_logic(
     run_id: UUID,
     *,
@@ -210,14 +231,16 @@ def run_scheduled_task_logic(
         # a delete.
         task = run.task
         if task is None:
-            mark_run_status(
+            failed = fail_run_if_queued(
                 db_session=db_session,
                 run_id=run_id,
-                status=ScheduledTaskRunStatus.FAILED,
                 error_class=ScheduledTaskErrorClass.TASK_MISSING,
                 error_detail="Scheduled task row no longer exists",
             )
-            db_session.commit()
+            if failed:
+                # No task row means no owner/task name to notify with either;
+                # keep parity with the previous behaviour's best effort.
+                db_session.commit()
             return
         task_id = task.id
         task_user_id = task.user_id
@@ -227,7 +250,8 @@ def run_scheduled_task_logic(
         # ensure_sandbox_running handles every state we care about:
         # creates a sandbox if none exists, waits out any concurrent
         # provisioner, wakes SLEEPING / TERMINATED / FAILED, and recovers a
-        # RUNNING-but-unhealthy pod.
+        # RUNNING-but-unhealthy pod. Waking can take minutes, during which
+        # the owner may cancel the still-QUEUED run.
         try:
             session_manager = SessionManager(db_session)
             sandbox = session_manager.ensure_sandbox_running(
@@ -244,31 +268,38 @@ def run_scheduled_task_logic(
                 if exc_message
                 else exc_name
             )
-            mark_run_status(
+            failed = fail_run_if_queued(
                 db_session=db_session,
                 run_id=run_id,
-                status=ScheduledTaskRunStatus.FAILED,
                 error_class=ScheduledTaskErrorClass.SANDBOX_WAKE_FAILED,
                 error_detail=error_detail,
             )
-            _notify(
-                db_session=db_session,
-                user_id=task_user_id,
-                task_name=task_name,
-                task_id=task_id,
-                run_id=run_id,
-                notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-            )
+            if failed:
+                _notify(
+                    db_session=db_session,
+                    user_id=task_user_id,
+                    task_name=task_name,
+                    task_id=task_id,
+                    run_id=run_id,
+                    notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+                )
             db_session.commit()
             return
 
         sandbox_id = sandbox.id
 
-        mark_run_status(
-            db_session=db_session,
-            run_id=run_id,
-            status=ScheduledTaskRunStatus.RUNNING,
-        )
+        # Conditional claim: a run cancelled (QUEUED -> CANCELLED) while the
+        # sandbox woke must never start an agent. A redelivered Celery message
+        # whose run already left QUEUED exits here too.
+        if not claim_queued_run(db_session=db_session, run_id=run_id):
+            current = _current_run_status(db_session, run_id)
+            logger.info(
+                "Scheduled run %s was not claimed (status=%s); skipping.",
+                run_id,
+                current,
+            )
+            db_session.commit()
+            return
         db_session.commit()
 
     # Phase 2: drive the agent. We open a fresh session inside the drive
@@ -293,32 +324,244 @@ def run_scheduled_task_logic(
         )
     except Exception:
         # Catch-all: anything that escapes the inner drive (e.g. session
-        # creation failure). Translate to FAILED.
+        # creation failure). A cancel requested during setup settles as
+        # CANCELLED; everything else non-terminal translates to FAILED.
         logger.exception("Unexpected error executing scheduled run %s", run_id)
         with get_session_with_current_tenant() as db_session:
             try:
-                run = get_run(db_session=db_session, run_id=run_id)
-                if not run.status.is_terminal():
-                    mark_run_status(
+                current = _current_run_status(db_session, run_id)
+                if current == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+                    settle_run(
                         db_session=db_session,
                         run_id=run_id,
-                        status=ScheduledTaskRunStatus.FAILED,
+                        expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                        new_status=ScheduledTaskRunStatus.CANCELLED,
+                    )
+                elif current is not None and not current.is_terminal():
+                    if settle_run(
+                        db_session=db_session,
+                        run_id=run_id,
+                        expected=(
+                            ScheduledTaskRunStatus.QUEUED,
+                            ScheduledTaskRunStatus.RUNNING,
+                        ),
+                        new_status=ScheduledTaskRunStatus.FAILED,
                         error_class=ScheduledTaskErrorClass.EXECUTOR_ERROR,
                         error_detail="Unexpected executor failure",
-                    )
-                    _notify(
-                        db_session=db_session,
-                        user_id=task_user_id,
-                        task_name=task_name,
-                        task_id=task_id,
-                        run_id=run_id,
-                        notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-                    )
+                    ):
+                        _notify(
+                            db_session=db_session,
+                            user_id=task_user_id,
+                            task_name=task_name,
+                            task_id=task_id,
+                            run_id=run_id,
+                            notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+                        )
                 db_session.commit()
             except Exception:
                 logger.exception(
                     "Double-failure marking scheduled run %s as failed", run_id
                 )
+
+
+def _settle_completed_turn(
+    *,
+    db_session: Any,
+    run_id: UUID,
+    task_user_id: UUID,
+    task_name: str,
+    task_id: UUID,
+    session_id: UUID,
+    summary: str,
+    final_event_count: int,
+    clean_finish: bool,
+    approval_required: bool,
+    terminal_error: Error | None,
+    cancelled: bool,
+    got_prompt_response: bool,
+) -> None:
+    """Write the terminal run status after the agent stream ended.
+
+    The current status is read fresh because the cancel endpoint writes
+    CANCEL_REQUESTED from another process. Terminal rows are never
+    overwritten — a real result always wins.
+    """
+    current = _current_run_status(db_session, run_id)
+    if current is None or current.is_terminal():
+        db_session.commit()
+        return
+
+    if current == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+        # Owner-initiated stop: never a failure notification. If the agent
+        # actually finished cleanly before the abort landed, keep the real
+        # success; otherwise settle CANCELLED.
+        if clean_finish:
+            settle_run(
+                db_session=db_session,
+                run_id=run_id,
+                expected=(
+                    ScheduledTaskRunStatus.RUNNING,
+                    ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                ),
+                new_status=ScheduledTaskRunStatus.SUCCEEDED,
+                summary=summary or None,
+            )
+            logger.info(
+                "Scheduled run %s completed before cancellation "
+                "took effect (events=%d, session=%s)",
+                run_id,
+                final_event_count,
+                session_id,
+            )
+        else:
+            settle_run(
+                db_session=db_session,
+                run_id=run_id,
+                expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                new_status=ScheduledTaskRunStatus.CANCELLED,
+                summary=summary or None,
+            )
+            logger.info(
+                "Scheduled run %s cancelled by owner (events=%d, session=%s)",
+                run_id,
+                final_event_count,
+                session_id,
+            )
+        db_session.commit()
+        return
+
+    # Plain RUNNING: preserve the original failure semantics.
+    if approval_required:
+        if settle_run(
+            db_session=db_session,
+            run_id=run_id,
+            expected=ScheduledTaskRunStatus.RUNNING,
+            new_status=ScheduledTaskRunStatus.FAILED,
+            error_class=ScheduledTaskErrorClass.AGENT_PERMISSION_REQUIRED,
+            error_detail=(
+                "Execution stopped because the agent needs permission. "
+                "Review permissions and run the task again."
+            ),
+            summary=summary or None,
+        ):
+            _notify(
+                db_session=db_session,
+                user_id=task_user_id,
+                task_name=task_name,
+                task_id=task_id,
+                run_id=run_id,
+                notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+            )
+        db_session.commit()
+        return
+
+    if terminal_error is not None or cancelled or not got_prompt_response:
+        if terminal_error is not None:
+            error_class = (
+                ScheduledTaskErrorClass.TIMEOUT
+                if terminal_error.code == TURN_ERROR_CODE_TIMEOUT
+                else ScheduledTaskErrorClass.AGENT_EXCEPTION
+            )
+            error_detail = (
+                terminal_error.message or "agent turn ended with an error"
+            )
+        elif cancelled:
+            error_class = ScheduledTaskErrorClass.AGENT_EXCEPTION
+            error_detail = "agent turn was aborted before completion"
+        else:
+            error_class = ScheduledTaskErrorClass.AGENT_EXCEPTION
+            error_detail = "agent stream ended without a completion response"
+        changed = settle_run(
+            db_session=db_session,
+            run_id=run_id,
+            expected=ScheduledTaskRunStatus.RUNNING,
+            new_status=ScheduledTaskRunStatus.FAILED,
+            error_class=error_class,
+            error_detail=error_detail[:1000],
+        )
+        if changed:
+            _notify(
+                db_session=db_session,
+                user_id=task_user_id,
+                task_name=task_name,
+                task_id=task_id,
+                run_id=run_id,
+                notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+            )
+        db_session.commit()
+        logger.warning(
+            "Scheduled run %s failed (events=%d, error_class=%s): %s",
+            run_id,
+            final_event_count,
+            error_class.value,
+            error_detail,
+        )
+        return
+
+    # Clean completion path.
+    settle_run(
+        db_session=db_session,
+        run_id=run_id,
+        expected=ScheduledTaskRunStatus.RUNNING,
+        new_status=ScheduledTaskRunStatus.SUCCEEDED,
+        summary=summary or None,
+    )
+    db_session.commit()
+    logger.info(
+        "Scheduled run %s succeeded (events=%d, session=%s)",
+        run_id,
+        final_event_count,
+        session_id,
+    )
+
+
+def _settle_failed_turn(
+    *,
+    db_session: Any,
+    run_id: UUID,
+    task_user_id: UUID,
+    task_name: str,
+    task_id: UUID,
+    error_detail: str,
+) -> None:
+    """Settle a run whose agent drive raised.
+
+    A CANCEL_REQUESTED run that errors while the abort lands settles
+    CANCELLED without a notification; a still-RUNNING run settles FAILED and
+    notifies the owner. Best-effort: settlement errors are logged, never
+    raised.
+    """
+    try:
+        current = _current_run_status(db_session, run_id)
+        if current == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+            settle_run(
+                db_session=db_session,
+                run_id=run_id,
+                expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                new_status=ScheduledTaskRunStatus.CANCELLED,
+            )
+        elif current == ScheduledTaskRunStatus.RUNNING and settle_run(
+            db_session=db_session,
+            run_id=run_id,
+            expected=ScheduledTaskRunStatus.RUNNING,
+            new_status=ScheduledTaskRunStatus.FAILED,
+            error_class=ScheduledTaskErrorClass.AGENT_EXCEPTION,
+            error_detail=error_detail,
+        ):
+            _notify(
+                db_session=db_session,
+                user_id=task_user_id,
+                task_name=task_name,
+                task_id=task_id,
+                run_id=run_id,
+                notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+            )
+        db_session.commit()
+    except Exception:
+        logger.exception(
+            "Failed to settle scheduled run %s after error",
+            run_id,
+        )
 
 
 def _drive_agent(
@@ -368,17 +611,34 @@ def _drive_agent(
                 db_session=db_session,
             )
 
-            # Wire the session id onto the run row so the UI can deep-link
-            # from the run history into the session view as soon as anything
-            # is persisted.
-            mark_run_status(
-                db_session=db_session,
-                run_id=run_id,
-                status=ScheduledTaskRunStatus.RUNNING,
-                session_id=session_id,
+            # Link the session id WITHOUT rewriting status: a concurrent
+            # cancel may already have moved RUNNING -> CANCEL_REQUESTED, and
+            # the UI can deep-link as soon as the link is persisted.
+            link_run_session(
+                db_session=db_session, run_id=run_id, session_id=session_id
             )
             update_sandbox_heartbeat(db_session, sandbox_id)
             db_session.commit()
+
+        # Cancel can land in the setup window before the prompt is sent (the
+        # abort RPC is skipped until opencode knows the session id). The user
+        # prompt persisted above stays viewable, but no agent turn starts.
+        status_at_entry = _current_run_status(db_session, run_id)
+        if status_at_entry == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+            settle_run(
+                db_session=db_session,
+                run_id=run_id,
+                expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                new_status=ScheduledTaskRunStatus.CANCELLED,
+            )
+            db_session.commit()
+            logger.info(
+                "Scheduled run %s cancelled before the agent prompt", run_id
+            )
+            return
+        if status_at_entry != ScheduledTaskRunStatus.RUNNING:
+            # Terminal (swept/raced) or missing — never start the turn.
+            return
 
         state = BuildStreamingState(turn_index=0)
         deadline = time.monotonic() + budget_seconds
@@ -397,21 +657,33 @@ def _drive_agent(
         final_event_count = 0
         with session_manager.prompt_slot(sandbox_id, session_id) as slot:
             if not slot.acquired:
-                mark_run_status(
-                    db_session=db_session,
-                    run_id=run_id,
-                    status=ScheduledTaskRunStatus.FAILED,
-                    error_class=ScheduledTaskErrorClass.AGENT_EXCEPTION,
-                    error_detail="Concurrent turn in flight for build session.",
-                )
-                _notify(
-                    db_session=db_session,
-                    user_id=task_user_id,
-                    task_name=task_name,
-                    task_id=task_id,
-                    run_id=run_id,
-                    notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-                )
+                current = _current_run_status(db_session, run_id)
+                if current == ScheduledTaskRunStatus.CANCEL_REQUESTED:
+                    settle_run(
+                        db_session=db_session,
+                        run_id=run_id,
+                        expected=ScheduledTaskRunStatus.CANCEL_REQUESTED,
+                        new_status=ScheduledTaskRunStatus.CANCELLED,
+                    )
+                elif current == ScheduledTaskRunStatus.RUNNING:
+                    if settle_run(
+                        db_session=db_session,
+                        run_id=run_id,
+                        expected=ScheduledTaskRunStatus.RUNNING,
+                        new_status=ScheduledTaskRunStatus.FAILED,
+                        error_class=ScheduledTaskErrorClass.AGENT_EXCEPTION,
+                        error_detail=(
+                            "Concurrent turn in flight for build session."
+                        ),
+                    ):
+                        _notify(
+                            db_session=db_session,
+                            user_id=task_user_id,
+                            task_name=task_name,
+                            task_id=task_id,
+                            run_id=run_id,
+                            notif_type=NotificationType.SCHEDULED_TASK_FAILED,
+                        )
                 db_session.commit()
                 return
             output_manager = get_sandbox_manager()
@@ -462,9 +734,12 @@ def _drive_agent(
                         # Break before the budget check: a deadline tripping exactly as
                         # the agent finishes must not mis-mark a success as timed-out.
                         if isinstance(sandbox_event, PromptResponse):
-                            # Scheduled runs have no interrupt mechanism, so a cancelled
-                            # terminal means opencode aborted the agent
-                            # (MessageAbortedError) — record it as a failure, not success.
+                            # A cancelled terminal means opencode aborted the
+                            # agent (MessageAbortedError). When the run is
+                            # CANCEL_REQUESTED that is the owner's stop action;
+                            # the adjudication below settles it CANCELLED. A
+                            # spontaneous cancel on a plain RUNNING run is still
+                            # a failure.
                             cancelled = (
                                 getattr(  # ods: ignore[getattr]
                                     sandbox_event, "stop_reason", None
@@ -511,94 +786,37 @@ def _drive_agent(
                         message="Prompt slot lease lost mid-turn.",
                     )
 
-                if approval_required:
-                    summary = summary_from_chunks or _summary_from_session_messages(
-                        session_id, db_session
-                    )
-                    mark_run_status(
-                        db_session=db_session,
-                        run_id=run_id,
-                        status=ScheduledTaskRunStatus.FAILED,
-                        error_class=ScheduledTaskErrorClass.AGENT_PERMISSION_REQUIRED,
-                        error_detail="Execution stopped because the agent needs permission. Review permissions and run the task again.",
-                        summary=summary or None,
-                    )
-                    _notify(
-                        db_session=db_session,
-                        user_id=task_user_id,
-                        task_name=task_name,
-                        task_id=task_id,
-                        run_id=run_id,
-                        notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-                    )
-                    db_session.commit()
-                    return
-
-                if terminal_error is not None or cancelled or not got_prompt_response:
-                    if terminal_error is not None:
-                        error_class = (
-                            ScheduledTaskErrorClass.TIMEOUT
-                            if terminal_error.code == TURN_ERROR_CODE_TIMEOUT
-                            else ScheduledTaskErrorClass.AGENT_EXCEPTION
-                        )
-                        error_detail = (
-                            terminal_error.message or "agent turn ended with an error"
-                        )
-                    elif cancelled:
-                        error_class = ScheduledTaskErrorClass.AGENT_EXCEPTION
-                        error_detail = "agent turn was aborted before completion"
-                    else:
-                        error_class = ScheduledTaskErrorClass.AGENT_EXCEPTION
-                        error_detail = (
-                            "agent stream ended without a completion response"
-                        )
-                    mark_run_status(
-                        db_session=db_session,
-                        run_id=run_id,
-                        status=ScheduledTaskRunStatus.FAILED,
-                        error_class=error_class,
-                        error_detail=error_detail[:1000],
-                    )
-                    _notify(
-                        db_session=db_session,
-                        user_id=task_user_id,
-                        task_name=task_name,
-                        task_id=task_id,
-                        run_id=run_id,
-                        notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-                    )
-                    db_session.commit()
-                    logger.warning(
-                        "Scheduled run %s failed (events=%d, error_class=%s): %s",
-                        run_id,
-                        final_event_count,
-                        error_class.value,
-                        error_detail,
-                    )
-                    return
-
-                # Clean completion path.
                 summary = summary_from_chunks or _summary_from_session_messages(
                     session_id, db_session
                 )
-                mark_run_status(
+                # A full agent response without an abort/error/permission ask.
+                clean_finish = (
+                    got_prompt_response
+                    and not cancelled
+                    and terminal_error is None
+                    and not approval_required
+                )
+                _settle_completed_turn(
                     db_session=db_session,
                     run_id=run_id,
-                    status=ScheduledTaskRunStatus.SUCCEEDED,
-                    summary=summary or None,
-                )
-                db_session.commit()
-                logger.info(
-                    "Scheduled run %s succeeded (events=%d, session=%s)",
-                    run_id,
-                    final_event_count,
-                    session_id,
+                    task_user_id=task_user_id,
+                    task_name=task_name,
+                    task_id=task_id,
+                    session_id=session_id,
+                    summary=summary,
+                    final_event_count=final_event_count,
+                    clean_finish=clean_finish,
+                    approval_required=approval_required,
+                    terminal_error=terminal_error,
+                    cancelled=cancelled,
+                    got_prompt_response=got_prompt_response,
                 )
                 return
             except Exception as exc:
                 # Roll back any uncommitted persistence work and translate
                 # to FAILED. Do NOT re-raise — Celery would retry, which is
-                # explicitly out of scope for V1.
+                # explicitly out of scope for V1. A CANCEL_REQUESTED run that
+                # errors while the abort lands settles CANCELLED, no notify.
                 db_session.rollback()
                 exc_name = type(exc).__name__
                 exc_message = str(exc)
@@ -610,28 +828,14 @@ def _drive_agent(
                     if exc_message
                     else exc_name
                 )
-                try:
-                    mark_run_status(
-                        db_session=db_session,
-                        run_id=run_id,
-                        status=ScheduledTaskRunStatus.FAILED,
-                        error_class=ScheduledTaskErrorClass.AGENT_EXCEPTION,
-                        error_detail=error_detail,
-                    )
-                    _notify(
-                        db_session=db_session,
-                        user_id=task_user_id,
-                        task_name=task_name,
-                        task_id=task_id,
-                        run_id=run_id,
-                        notif_type=NotificationType.SCHEDULED_TASK_FAILED,
-                    )
-                    db_session.commit()
-                except Exception:
-                    logger.exception(
-                        "Failed to mark scheduled run %s as FAILED after error",
-                        run_id,
-                    )
+                _settle_failed_turn(
+                    db_session=db_session,
+                    run_id=run_id,
+                    task_user_id=task_user_id,
+                    task_name=task_name,
+                    task_id=task_id,
+                    error_detail=error_detail,
+                )
                 logger.exception("Scheduled run %s failed", run_id)
                 return
             finally:

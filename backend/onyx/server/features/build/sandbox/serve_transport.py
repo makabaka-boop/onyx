@@ -708,6 +708,30 @@ class _ServeMixin:
             if abort is not None:
                 abort()
 
+    def abort_opencode_session_strict(
+        self, sandbox_id: UUID, session_id: UUID, opencode_session_id: str
+    ) -> None:
+        """Abort an opencode turn, propagating transport/HTTP failures.
+
+        The scheduled-run cancel endpoint only reports the stop as requested
+        when opencode accepted the abort; use this instead of the swallowing
+        :meth:`abort_opencode_session`. Abort is idempotent, so callers may
+        safely retry.
+        """
+        session_path = self._session_directory(session_id)
+        client = self._build_serve_client(
+            sandbox_id, session_path, with_event_bus=False
+        )
+        try:
+            client.abort_checked(opencode_session_id, directory=session_path)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                logger.warning(
+                    "[SANDBOX-SERVE] abort client close failed", exc_info=True
+                )
+
     def delete_opencode_session(
         self,
         sandbox_id: UUID,

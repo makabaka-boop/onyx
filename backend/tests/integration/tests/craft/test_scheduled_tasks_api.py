@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Generator
+from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
 
@@ -21,6 +22,7 @@ from onyx.db.enums import (
 )
 from onyx.db.mcp import create_mcp_server__no_commit, update_mcp_server__no_commit
 from onyx.db.models import ScheduledTask, ScheduledTaskRun, Tool
+from onyx.db.scheduled_task import insert_run
 from shared_configs.configs import POSTGRES_DEFAULT_SCHEMA_STANDARD_VALUE
 from shared_configs.contextvars import CURRENT_TENANT_ID_CONTEXTVAR
 from tests.integration.common_utils.constants import API_SERVER_URL
@@ -139,6 +141,40 @@ def _get_runs_for_task(task_id: UUID) -> list[ScheduledTaskRun]:
             .scalars()
             .all()
         )
+
+
+def _cancel_run(
+    user: DATestUser, task_id: UUID, run_id: UUID
+) -> httpx.Response:
+    return client.post(
+        _url(str(task_id), "runs", str(run_id), "cancel"),
+        headers=user.headers,
+        cookies=user.cookies,
+    )
+
+
+def _seed_run_row(
+    task_id: UUID,
+    *,
+    status: ScheduledTaskRunStatus,
+    trigger_source: ScheduledTaskTriggerSource = ScheduledTaskTriggerSource.SCHEDULED,
+) -> UUID:
+    """Insert a run row directly so cancel tests do not race the live executor."""
+    with get_session_with_current_tenant() as db_session:
+        run = insert_run(
+            db_session=db_session,
+            task_id=task_id,
+            trigger_source=trigger_source,
+            status=status,
+        )
+        if status not in (
+            ScheduledTaskRunStatus.QUEUED,
+            ScheduledTaskRunStatus.RUNNING,
+            ScheduledTaskRunStatus.CANCEL_REQUESTED,
+        ):
+            run.finished_at = datetime.now(tz=timezone.utc)
+        db_session.commit()
+        return run.id
 
 
 def _create_mcp_server(owner: str, *, available_in_craft: bool) -> int:
@@ -372,3 +408,100 @@ def test_list_runs_paginates_by_started_at_cursor(admin_user: DATestUser) -> Non
     page_two_body = page_two.json()
     assert len(page_two_body["items"]) >= 1
     assert page_one_body["items"][0]["id"] != page_two_body["items"][0]["id"]
+
+
+@pytest.mark.parametrize(
+    "trigger_source",
+    [
+        ScheduledTaskTriggerSource.SCHEDULED,
+        ScheduledTaskTriggerSource.MANUAL_RUN_NOW,
+    ],
+)
+def test_cancel_queued_run_settles_cancelled(
+    admin_user: DATestUser,
+    trigger_source: ScheduledTaskTriggerSource,
+) -> None:
+    response = _create_task(admin_user, status=ScheduledTaskStatus.PAUSED)
+    response.raise_for_status()
+    task_id = UUID(response.json()["id"])
+    run_id = _seed_run_row(
+        task_id,
+        status=ScheduledTaskRunStatus.QUEUED,
+        trigger_source=trigger_source,
+    )
+    before = _get_task_row(task_id)
+    assert before is not None
+    before_status, before_next_run = before.status, before.next_run_at
+
+    cancel = _cancel_run(admin_user, task_id, run_id)
+    cancel.raise_for_status()
+    assert cancel.json()["status"] == ScheduledTaskRunStatus.CANCELLED.value
+
+    [run] = [r for r in _get_runs_for_task(task_id) if r.id == run_id]
+    assert run.status == ScheduledTaskRunStatus.CANCELLED
+    assert run.finished_at is not None
+
+    task = _get_task_row(task_id)
+    assert task is not None
+    # Cancelling one run must not toggle the task or touch its schedule.
+    assert task.status == before_status
+    assert task.next_run_at == before_next_run
+
+
+def test_cancel_running_run_without_session_requests_stop(
+    admin_user: DATestUser,
+) -> None:
+    response = _create_task(admin_user, status=ScheduledTaskStatus.PAUSED)
+    response.raise_for_status()
+    task_id = UUID(response.json()["id"])
+    run_id = _seed_run_row(
+        task_id,
+        status=ScheduledTaskRunStatus.RUNNING,
+        trigger_source=ScheduledTaskTriggerSource.MANUAL_RUN_NOW,
+    )
+
+    # No linked opencode session yet: the API records the stop request and the
+    # executor settles the row before the first prompt, so no 5xx is expected.
+    cancel = _cancel_run(admin_user, task_id, run_id)
+    cancel.raise_for_status()
+    assert cancel.json()["status"] == ScheduledTaskRunStatus.CANCEL_REQUESTED.value
+
+    [run] = [r for r in _get_runs_for_task(task_id) if r.id == run_id]
+    assert run.status == ScheduledTaskRunStatus.CANCEL_REQUESTED
+    assert run.finished_at is None
+
+
+def test_cancel_terminal_run_conflicts_and_preserves_row(
+    admin_user: DATestUser,
+) -> None:
+    response = _create_task(admin_user, status=ScheduledTaskStatus.PAUSED)
+    response.raise_for_status()
+    task_id = UUID(response.json()["id"])
+    run_id = _seed_run_row(
+        task_id,
+        status=ScheduledTaskRunStatus.SUCCEEDED,
+    )
+
+    cancel = _cancel_run(admin_user, task_id, run_id)
+    assert cancel.status_code == 409
+
+    [run] = [r for r in _get_runs_for_task(task_id) if r.id == run_id]
+    assert run.status == ScheduledTaskRunStatus.SUCCEEDED
+    assert run.finished_at is not None
+
+
+def test_cancel_run_by_non_owner_is_not_found(
+    admin_user: DATestUser,
+    basic_user: DATestUser,
+) -> None:
+    response = _create_task(admin_user, status=ScheduledTaskStatus.PAUSED)
+    response.raise_for_status()
+    task_id = UUID(response.json()["id"])
+    run_id = _seed_run_row(task_id, status=ScheduledTaskRunStatus.QUEUED)
+
+    cancel = _cancel_run(basic_user, task_id, run_id)
+    assert cancel.status_code == 404
+
+    # The owner's row is untouched.
+    [run] = [r for r in _get_runs_for_task(task_id) if r.id == run_id]
+    assert run.status == ScheduledTaskRunStatus.QUEUED

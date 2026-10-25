@@ -874,9 +874,14 @@ function reconcileCompletedTranscript(
           const run = await fetchScheduledRunContext(sessionId);
           if (!ownsCompletion()) return;
           if (run.run_id !== owner.runId) return;
+          // A user-cancelled run settles with the saved transcript, not as a
+          // failure; CANCEL_REQUESTED still waits for the final status.
           scheduledFailure =
             run.status === "FAILED" || run.status === "SKIPPED";
-          waiting = run.status === "RUNNING" || run.status === "QUEUED";
+          waiting =
+            run.status === "RUNNING" ||
+            run.status === "QUEUED" ||
+            run.status === "CANCEL_REQUESTED";
           approvalPause = run.status === "AWAITING_APPROVAL";
         } else if (!completion) {
           const activeTurn = await fetchActiveTurn(sessionId);
