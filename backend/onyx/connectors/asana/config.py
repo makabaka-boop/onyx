@@ -7,6 +7,7 @@ from onyx.connectors.field_policy import (
     FieldPolicy,
     ScopeDirection,
     ScopeInclude,
+    ScopeToggle,
 )
 from onyx.connectors.planning_rule import ConnectorChangeOverride
 
@@ -33,6 +34,12 @@ class AsanaConnectorConfig(ConnectorConfig):
             depends_on=("asana_project_ids",),
         ),
     ] = None
+    # Walks subtasks of every in-scope project task, at every depth. Each
+    # subtask is a separate document, including subtasks that are not project
+    # members themselves.
+    index_subtasks: Annotated[
+        bool, FieldPolicy(FieldClass.SCOPE, scope=ScopeToggle(widens_when=True))
+    ] = False
     batch_size: Annotated[int, _COSMETIC] = INDEX_BATCH_SIZE
     continue_on_failure: Annotated[bool, _COSMETIC] = CONTINUE_ON_CONNECTOR_FAILURE
 

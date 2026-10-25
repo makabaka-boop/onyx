@@ -4692,6 +4692,10 @@
             "asana_team_id": {
               "label": "Team-ID",
               "description": "ID eines Teams, das für den Zugriff auf teamweit sichtbare Tasks verwendet wird. So lassen sich neben öffentlichen Tasks auch teamweit sichtbare Tasks indexieren. Leer lassen, wenn Sie diese Funktion nicht nutzen möchten."
+            },
+            "index_subtasks": {
+              "label": "Unteraufgaben indexieren",
+              "description": "Indexiert die Unteraufgaben der Tasks in den ausgewählten Projekten auf allen Ebenen, einschließlich Unteraufgaben, die keinem Projekt hinzugefügt wurden. Jede Unteraufgabe wird zu einem eigenen Dokument mit Titel und Link des übergeordneten Tasks. Standardmäßig deaktiviert. Die Synchronisierung dauert bei Aktivierung länger."
             }
           }
         },

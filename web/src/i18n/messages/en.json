@@ -4692,6 +4692,10 @@
             "asana_team_id": {
               "label": "Team ID",
               "description": "ID of a team to use for accessing team-visible tasks. This allows indexing of team-visible tasks in addition to public tasks. Leave empty if you don't want to use this feature."
+            },
+            "index_subtasks": {
+              "label": "Index Subtasks",
+              "description": "Index subtasks of the tasks in the selected projects, at every depth, including subtasks that are not members of a project. Each subtask becomes a separate document with its parent task title and link. Disabled by default. Syncing takes longer when enabled."
             }
           }
         },

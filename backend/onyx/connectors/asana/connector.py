@@ -22,6 +22,7 @@ class AsanaConnector(LoadConnector, PollConnector):
         asana_workspace_id: str,
         asana_project_ids: str | None = None,
         asana_team_id: str | None = None,
+        index_subtasks: bool = False,
         batch_size: int = INDEX_BATCH_SIZE,
         continue_on_failure: bool = CONTINUE_ON_CONNECTOR_FAILURE,
     ) -> None:
@@ -36,6 +37,7 @@ class AsanaConnector(LoadConnector, PollConnector):
         else:
             self.project_ids_to_index = None
         self.asana_team_id = (asana_team_id.strip() or None) if asana_team_id else None
+        self.index_subtasks = index_subtasks
         self.batch_size = batch_size
         self.continue_on_failure = continue_on_failure
         logger.info(
@@ -65,7 +67,12 @@ class AsanaConnector(LoadConnector, PollConnector):
             team_gid=self.asana_team_id,
         )
         docs_batch: list[Document | HierarchyNode] = []
-        tasks = asana.get_tasks(self.project_ids_to_index, start_time)
+        tasks = asana.get_tasks(
+            project_gids=self.project_ids_to_index,
+            start_date=start_time,
+            start_seconds=start,
+            include_subtasks=self.index_subtasks,
+        )
 
         for task in tasks:
             doc = self._message_to_doc(task)

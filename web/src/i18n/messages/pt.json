@@ -4692,6 +4692,10 @@
             "asana_team_id": {
               "label": "ID da equipe",
               "description": "ID de uma equipe a usar para acessar tarefas visíveis para a equipe. Isso permite indexar tarefas visíveis para a equipe, além das tarefas públicas. Deixe vazio se você não quiser usar este recurso."
+            },
+            "index_subtasks": {
+              "label": "Indexar subtarefas",
+              "description": "Indexa as subtarefas das tarefas nos projetos selecionados em todos os níveis, incluindo subtarefas que não foram adicionadas a nenhum projeto. Cada subtarefa se torna um documento separado com o título e o link da sua tarefa pai. Desativado por padrão. A sincronização demora mais quando ativado."
             }
           }
         },

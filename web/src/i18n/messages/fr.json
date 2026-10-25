@@ -4692,6 +4692,10 @@
             "asana_team_id": {
               "label": "ID de l'équipe",
               "description": "ID d'une équipe à utiliser pour accéder aux tâches visibles par l'équipe. Cela permet d'indexer les tâches visibles par l'équipe en plus des tâches publiques. Laissez vide si vous ne voulez pas utiliser cette fonctionnalité."
+            },
+            "index_subtasks": {
+              "label": "Indexer les sous-tâches",
+              "description": "Indexe les sous-tâches des tâches des projets sélectionnés, à tous les niveaux, y compris les sous-tâches qui ne sont pas membres d'un projet. Chaque sous-tâche devient un document distinct contenant le titre et le lien de sa tâche parente. Désactivé par défaut. La synchronisation est plus longue lorsque l'option est activée."
             }
           }
         },
